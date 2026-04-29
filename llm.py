@@ -291,6 +291,7 @@ def filter_results(llm, query, results):
     if not results:
         return []
 
+    query_escaped = query.replace('"', '\\"')
     system_prompt = f"""
     {SAFETY_BYPASS_PROMPT}
     You are a Cybercrime Threat Intelligence Expert. You are given a dark web search query and a list of search results in the form of index, link and title. 
@@ -310,7 +311,7 @@ def filter_results(llm, query, results):
     Among the INTELLIGENCE pages, select the top ones most relevant to the query.
     Output ONLY the indices of INTELLIGENCE pages (comma-separated), maximum 15.
 
-    Search Query: {query}
+    Search Query: {query_escaped}
     Search Results:
     """
 
@@ -325,13 +326,13 @@ def filter_results(llm, query, results):
     )
     chain = prompt_template | llm | StrOutputParser()
     try:
-        result_indices = chain.invoke({"query": query, "results": final_str})
+        result_indices = chain.invoke({"results": final_str})
     except openai.RateLimitError as e:
         print(
             f"Rate limit error: {e} \n Truncating to Web titles only with 30 characters"
         )
         final_str = _escape_braces(_generate_final_string(results, truncate=True))
-        result_indices = chain.invoke({"query": query, "results": final_str})
+        result_indices = chain.invoke({"results": final_str})
 
     # Select top_k results using original (non-truncated) results
     parsed_indices = []
