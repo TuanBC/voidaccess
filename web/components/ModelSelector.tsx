@@ -14,6 +14,7 @@ interface ModelInfo {
   provider: string;
   free_tier: boolean;
   recommended: boolean;
+  default?: boolean;
   context_window?: number | null;
 }
 
@@ -102,6 +103,8 @@ interface ModelSelectorProps {
 // ---------------------------------------------------------------------------
 
 export function ModelSelector({ value, onChange }: ModelSelectorProps) {
+  const DEFAULT_PLATFORM_MODEL = "openrouter/deepseek/deepseek-chat";
+
   const [modelList, setModelList] = useState<ModelListResponse | null>(null);
   const [loadingList, setLoadingList] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
@@ -109,6 +112,8 @@ export function ModelSelector({ value, onChange }: ModelSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [mode, setMode] = useState<"browse" | "custom">("browse");
   const [search, setSearch] = useState("");
+
+  const [selectedModel, setSelectedModel] = useState(value || DEFAULT_PLATFORM_MODEL);
 
   const [customInput, setCustomInput] = useState("");
   const [validating, setValidating] = useState(false);
@@ -371,176 +376,16 @@ export function ModelSelector({ value, onChange }: ModelSelectorProps) {
                     >
                       ×
                     </button>
-                  )}
-                </div>
-              </div>
+)}
+        </div>
 
-              {/* List */}
-              <div
-                ref={listRef}
-                className="overflow-y-auto"
-                style={{ maxHeight: "340px" }}
-                role="listbox"
-              >
-                {loadingList && (
-                  <div className="flex items-center justify-center gap-2 py-8 text-[11px] text-[var(--text-muted)]">
-                    <span className="h-3 w-3 animate-spin rounded-full border border-[var(--accent)] border-t-transparent" />
-                    Loading models...
-                  </div>
-                )}
-
-                {listError && (
-                  <div className="px-4 py-6 text-center text-[11px] text-[var(--warning)]">
-                    {listError}
-                    <button
-                      type="button"
-                      onClick={() => void fetchModelList(true)}
-                      className="ml-2 underline hover:text-[var(--text-primary)]"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-
-                {!loadingList && !listError && grouped.length === 0 && (
-                  <div className="px-4 py-6 text-center text-[11px] text-[var(--text-muted)]">
-                    {search ? "No models match your search." : "No models available."}
-                  </div>
-                )}
-
-                {!loadingList && !listError && grouped.map((group) => (
-                  <div key={group.provider}>
-                    {/* Provider header */}
-                    <div className="sticky top-0 bg-[var(--bg-surface)]/95 px-3 py-1.5 backdrop-blur-sm">
-                      <span className="font-mono text-[9px] font-bold uppercase tracking-[0.15em] text-[var(--text-muted)]">
-                        {group.provider}
-                      </span>
-                    </div>
-
-                    {/* Models */}
-                    {group.models.map((m, idx) => {
-                      const globalIdx = filtered.findIndex((f) => f.id === m.id);
-                      const isFocused = globalIdx === focusedIndex;
-                      const isSelected = m.id === value;
-                      return (
-                        <button
-                          key={m.id}
-                          type="button"
-                          role="option"
-                          aria-selected={isSelected}
-                          onClick={() => { onChange(m.id); setIsOpen(false); }}
-                          onMouseEnter={() => setFocusedIndex(globalIdx)}
-                          className={`flex w-full items-center justify-between px-3 py-2 text-left transition-colors ${
-                            isFocused
-                              ? "bg-[var(--accent-dim)]"
-                              : isSelected
-                              ? "bg-[var(--bg-raised)]"
-                              : "hover:bg-[var(--bg-raised)]"
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            {isSelected && (
-                              <span className="shrink-0 text-[var(--accent)] text-[10px]">✓</span>
-                            )}
-                            <span className={`truncate font-mono text-[11px] ${isSelected ? "text-[var(--accent)]" : "text-[var(--text-primary)]"}`}>
-                              {m.name}
-                            </span>
-                            {m.free_tier && (
-                              <span className="shrink-0 rounded bg-[var(--success)]/15 px-1 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider text-[var(--success)]">
-                                Free
-                              </span>
-                            )}
-                            {m.recommended && !m.free_tier && (
-                              <span className="shrink-0 rounded bg-[var(--accent)]/15 px-1 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider text-[var(--accent)]">
-                                ★
-                              </span>
-                            )}
-                          </div>
-                          {m.context_window && (
-                            <span className="shrink-0 font-mono text-[9px] text-[var(--text-muted)]">
-                              {formatContextWindow(m.context_window)}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
-
-                {/* Unconfigured providers */}
-                {!loadingList && !listError && modelList && (
-                  <div>
-                    {modelList.providers.filter((p) => !p.configured).map((p) => (
-                      <div key={p.name} className="border-t border-[var(--border-dim)] px-3 py-2">
-                        <div className="flex items-center justify-between">
-                          <span className="font-mono text-[10px] text-[var(--text-muted)]">
-                            {p.name}
-                          </span>
-                          <Link
-                            href="/settings"
-                            onClick={() => setIsOpen(false)}
-                            className="font-mono text-[9px] text-[var(--accent)] hover:underline"
-                          >
-                            Add API key →
-                          </Link>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-
-          {/* ── Mode B: Custom ID ── */}
-          {mode === "custom" && (
-            <div className="p-4">
-              <p className="mb-3 font-mono text-[10px] leading-relaxed text-[var(--text-muted)]">
-                Enter any model ID directly. Validation is advisory — you can still submit without a valid result.
-              </p>
-
-              <input
-                type="text"
-                value={customInput}
-                onChange={(e) => handleCustomInput(e.target.value)}
-                placeholder="e.g. openrouter/meta-llama/llama-3.3-70b-instruct"
-                autoFocus
-                className="w-full rounded-md border border-[var(--border-dim)] bg-[var(--bg-overlay)] px-3 py-2 font-mono text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent-border)]"
-              />
-
-              {/* Validation state */}
-              <div className="mt-2 min-h-[28px]">
-                {validating && (
-                  <div className="flex items-center gap-2 font-mono text-[10px] text-[var(--text-muted)]">
-                    <span className="h-2.5 w-2.5 animate-spin rounded-full border border-[var(--text-muted)] border-t-transparent" />
-                    Checking model...
-                  </div>
-                )}
-                {!validating && validateResult && (
-                  <div
-                    className={`flex flex-col gap-0.5 font-mono text-[10px] ${
-                      validateResult.valid ? "text-[var(--success)]" : "text-[var(--danger)]"
-                    }`}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <span>{validateResult.valid ? "✓" : "✗"}</span>
-                      <span>{validateResult.message}</span>
-                    </div>
-                    {validateResult.suggestion && (
-                      <p className="pl-4 text-[var(--text-muted)]">{validateResult.suggestion}</p>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <button
-                type="button"
-                disabled={!customInput.trim()}
-                onClick={() => {
-                  if (customInput.trim()) {
-                    onChange(customInput.trim());
-                    setIsOpen(false);
-                  }
+        {/* Default model helper text */}
+        <p className="mt-1 font-mono text-[9px] text-[var(--text-muted)]">
+          Default: DeepSeek Chat via OpenRouter (fast, affordable, no refusals)
+        </p>
+      </div>
+    );
+  }
                 }}
                 className="mt-3 w-full rounded-md bg-[var(--accent)] px-3 py-1.5 font-mono text-[11px] font-semibold text-[var(--text-inverse)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
               >

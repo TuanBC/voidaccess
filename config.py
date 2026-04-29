@@ -111,6 +111,20 @@ else:
     PLAYWRIGHT_ENABLED = True
 
 
+DEFAULT_MODELS = {
+    "openrouter": "deepseek/deepseek-chat",
+    "openai":     "gpt-4o-mini",
+    "anthropic":  "claude-haiku-4-5-20251001",
+    "google":     "gemini-1.5-flash",
+    "groq":       "llama-3.3-70b-versatile",
+    "ollama":     "llama3.2",
+}
+
+DEFAULT_MODEL = os.getenv(
+    "DEFAULT_MODEL",
+    "openrouter/deepseek/deepseek-chat"
+)
+
 REQUIRED_KEYS = [
     "JWT_SECRET",
 ]

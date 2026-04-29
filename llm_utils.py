@@ -17,6 +17,8 @@ from config import (
     ANTHROPIC_API_KEY,
     LLAMA_CPP_BASE_URL,
     GROQ_API_KEY,
+    DEFAULT_MODELS,
+    DEFAULT_MODEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,99 @@ _common_llm_params = {
     "streaming": True,
     "callbacks": _common_callbacks,
 }
+
+RECOMMENDED_MODELS = [
+    {
+        "id": "openrouter/deepseek/deepseek-chat",
+        "name": "DeepSeek Chat",
+        "provider": "OpenRouter",
+        "free_tier": False,
+        "recommended": True,
+        "default": True,
+        "note": "Recommended default — fast, cheap, no refusals"
+    },
+    {
+        "id": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+        "name": "Llama 3.3 70B (Free)",
+        "provider": "OpenRouter",
+        "free_tier": True,
+        "recommended": True,
+        "default": False,
+        "note": "Free via OpenRouter — rate limited"
+    },
+    {
+        "id": "groq/llama-3.3-70b-versatile",
+        "name": "Llama 3.3 70B",
+        "provider": "Groq",
+        "free_tier": True,
+        "recommended": True,
+        "default": False,
+        "note": "Free via Groq — fastest inference"
+    },
+    {
+        "id": "groq/llama-3.1-8b-instant",
+        "name": "Llama 3.1 8B Instant",
+        "provider": "Groq",
+        "free_tier": True,
+        "recommended": False,
+        "default": False,
+        "note": "Free via Groq — fastest, lower quality"
+    },
+    {
+        "id": "openrouter/deepseek/deepseek-r1",
+        "name": "DeepSeek R1",
+        "provider": "OpenRouter",
+        "free_tier": False,
+        "recommended": False,
+        "default": False,
+        "note": "Reasoning model — slower but thorough"
+    },
+    {
+        "id": "openrouter/google/gemini-2.0-flash-001",
+        "name": "Gemini 2.0 Flash",
+        "provider": "OpenRouter",
+        "free_tier": False,
+        "recommended": False,
+        "default": False,
+        "note": "Fast, large context"
+    },
+    {
+        "id": "openrouter/anthropic/claude-haiku-4-5",
+        "name": "Claude Haiku",
+        "provider": "OpenRouter",
+        "free_tier": False,
+        "recommended": False,
+        "default": False,
+        "note": "Fast Anthropic model via OpenRouter"
+    },
+    {
+        "id": "gpt-4o-mini",
+        "name": "GPT-4o Mini",
+        "provider": "OpenAI",
+        "free_tier": False,
+        "recommended": True,
+        "default": False,
+        "note": "Best OpenAI price/performance"
+    },
+    {
+        "id": "claude-haiku-4-5-20251001",
+        "name": "Claude Haiku",
+        "provider": "Anthropic",
+        "free_tier": False,
+        "recommended": True,
+        "default": False,
+        "note": "Fastest Claude model"
+    },
+    {
+        "id": "gemini-1.5-flash",
+        "name": "Gemini 1.5 Flash",
+        "provider": "Google",
+        "free_tier": True,
+        "recommended": True,
+        "default": False,
+        "note": "Free tier via Google AI Studio"
+    },
+]
 
 # Map input model choices (lowercased) to their configuration
 # Each config includes the class and any model-specific constructor parameters
@@ -410,6 +505,8 @@ def _resolve_key(key_name: str, api_keys: Optional[dict]) -> Optional[str]:
 
 def _make_openrouter_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatOpenAI instance pointed at OpenRouter for *model_id*."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["openrouter"]
     key = _resolve_key("OPENROUTER_API_KEY", api_keys)
     if not key:
         raise ValueError(
@@ -424,6 +521,8 @@ def _make_openrouter_llm(model_id: str, api_keys: Optional[dict] = None):
 
 def _make_groq_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatOpenAI instance pointed at Groq for *model_id*."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["groq"]
     key = _resolve_key("GROQ_API_KEY", api_keys)
     if not key:
         raise ValueError(
@@ -438,6 +537,8 @@ def _make_groq_llm(model_id: str, api_keys: Optional[dict] = None):
 
 def _make_openai_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatOpenAI instance for a native OpenAI model."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["openai"]
     key = _resolve_key("OPENAI_API_KEY", api_keys)
     if not key:
         raise ValueError(
@@ -449,6 +550,8 @@ def _make_openai_llm(model_id: str, api_keys: Optional[dict] = None):
 
 def _make_anthropic_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatAnthropic instance."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["anthropic"]
     key = _resolve_key("ANTHROPIC_API_KEY", api_keys)
     if not key:
         raise ValueError(
@@ -461,6 +564,8 @@ def _make_anthropic_llm(model_id: str, api_keys: Optional[dict] = None):
 
 def _make_google_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatGoogleGenerativeAI instance."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["google"]
     key = _resolve_key("GOOGLE_API_KEY", api_keys)
     if not key:
         raise ValueError(
@@ -473,6 +578,8 @@ def _make_google_llm(model_id: str, api_keys: Optional[dict] = None):
 
 def _make_ollama_llm(model_id: str, api_keys: Optional[dict] = None):
     """Build a ChatOllama instance for a locally running model."""
+    if not model_id:
+        model_id = DEFAULT_MODELS["ollama"]
     base_url = OLLAMA_BASE_URL or "http://localhost:11434"
     return ChatOllama(**{**_common_llm_params, "model": model_id, "base_url": base_url})
 

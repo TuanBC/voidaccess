@@ -216,12 +216,17 @@ async def _get_investigation_model_choice(model: Optional[str]) -> tuple[str, An
     """Get model choices and selected model in a short-lived session."""
     from db.session import get_session
     from llm_utils import get_model_choices
+    import config as config_module
 
     with get_session() as session:
         model_choices = get_model_choices()
         if not model_choices:
             raise RuntimeError("No LLM models available")
-        selected_model = model or model_choices[0]
+        selected_model = (
+            model
+            or config_module.DEFAULT_MODEL
+            or "openrouter/deepseek/deepseek-chat"
+        )
         return selected_model, model_choices
 
 
@@ -313,6 +318,11 @@ async def _run_investigation_task(
 
         # ===== STEP 0: Get model choice and mark as processing =====
         selected_model, _ = await _get_investigation_model_choice(model)
+        logger.info(
+            "Investigation %s: using model '%s'",
+            inv_uuid,
+            selected_model,
+        )
         await _update_investigation_status(inv_uuid, "processing", model_used=selected_model)
         await _update_progress(inv_uuid, 0)
         logger.info("[%s] Starting investigation: %s", inv_uuid, query)

@@ -8,12 +8,13 @@ os.environ["USE_TORCH"] = "1"
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from llm_utils import _common_llm_params, resolve_model_config, get_model_choices
+from llm_utils import _common_llm_params, resolve_model_config, get_model_choices, DEFAULT_MODELS, DEFAULT_MODEL
 from config import (
     OPENAI_API_KEY,
     ANTHROPIC_API_KEY,
     GOOGLE_API_KEY,
     OPENROUTER_API_KEY,
+    GROQ_API_KEY,
 )
 import logging
 from typing import Any, Callable
@@ -194,6 +195,25 @@ def select_relevant_pages(
 
 
 def get_llm(model_choice, api_keys: dict | None = None):
+    if not model_choice or model_choice.strip().lower() in ("", "auto"):
+        model_choice = DEFAULT_MODEL
+
+    parts = model_choice.split("/", 1)
+    if len(parts) == 2 and parts[1] == "":
+        provider = parts[0].lower()
+        if provider == "openrouter":
+            model_choice = f"openrouter/{DEFAULT_MODELS['openrouter']}"
+        elif provider == "groq":
+            model_choice = f"groq/{DEFAULT_MODELS['groq']}"
+        elif provider == "openai":
+            model_choice = DEFAULT_MODELS["openai"]
+        elif provider == "anthropic":
+            model_choice = DEFAULT_MODELS["anthropic"]
+        elif provider == "google":
+            model_choice = DEFAULT_MODELS["google"]
+        elif provider == "ollama":
+            model_choice = f"ollama/{DEFAULT_MODELS['ollama']}"
+
     # Look up the configuration (cloud or local Ollama)
     config = resolve_model_config(model_choice)
 
@@ -247,18 +267,26 @@ def _ensure_credentials(model_choice: str, llm_class, model_params: dict) -> Non
             "Add it to your .env file or export it before running the app."
         )
 
+    params = model_params or {}
     class_name = getattr(llm_class, "__name__", str(llm_class))
 
     if "ChatAnthropic" in class_name:
-        _require(ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY", "Anthropic")
+        key = params.get("anthropic_api_key") or ANTHROPIC_API_KEY
+        _require(key, "ANTHROPIC_API_KEY", "Anthropic")
     elif "ChatGoogleGenerativeAI" in class_name:
-        _require(GOOGLE_API_KEY, "GOOGLE_API_KEY", "Google Gemini")
+        key = params.get("google_api_key") or GOOGLE_API_KEY
+        _require(key, "GOOGLE_API_KEY", "Google Gemini")
     elif "ChatOpenAI" in class_name:
-        base_url = (model_params or {}).get("base_url", "").lower()
+        base_url = params.get("base_url", "").lower()
         if "openrouter" in base_url:
-            _require(OPENROUTER_API_KEY, "OPENROUTER_API_KEY", "OpenRouter")
+            key = params.get("api_key") or params.get("openai_api_key") or OPENROUTER_API_KEY
+            _require(key, "OPENROUTER_API_KEY", "OpenRouter")
+        elif "groq" in base_url:
+            key = params.get("api_key") or params.get("openai_api_key") or GROQ_API_KEY
+            _require(key, "GROQ_API_KEY", "Groq")
         else:
-            _require(OPENAI_API_KEY, "OPENAI_API_KEY", "OpenAI")
+            key = params.get("api_key") or params.get("openai_api_key") or OPENAI_API_KEY
+            _require(key, "OPENAI_API_KEY", "OpenAI")
 
 
 def refine_query(llm, user_input):
@@ -420,7 +448,7 @@ PRESET_PROMPTS = {
     10. Ignore not safe for work texts from the analysis
 
     Output Format:
-    1. Input Query: {query}
+    1. Input Query: {{query}}
     2. Source Links Referenced for Analysis - this heading will include all source links used for the analysis
     3. Investigation Artifacts - this heading will include all technical artifacts identified including name, email, phone, cryptocurrency addresses, domains, darkweb markets, forum names, threat actor information, malware names, etc.
     4. Key Insights
@@ -446,7 +474,7 @@ PRESET_PROMPTS = {
     9. Be objective and analytical. Ignore not safe for work texts.
 
     Output Format:
-    1. Input Query: {query}
+    1. Input Query: {{query}}
     2. Source Links Referenced for Analysis
     3. Malware / Ransomware Indicators (hashes, C2s, payload names, TTPs)
     4. Threat Actor Profile (group name, aliases, known victims, sector targeting)
@@ -472,7 +500,7 @@ PRESET_PROMPTS = {
     8. Be objective. Ignore not safe for work texts. Handle all personal data with discretion.
 
     Output Format:
-    1. Input Query: {query}
+    1. Input Query: {{query}}
     2. Source Links Referenced for Analysis
     3. Exposed PII Artifacts (type, value, source context)
     4. Breach / Marketplace Sources Identified
@@ -499,7 +527,7 @@ PRESET_PROMPTS = {
     8. Be objective and analytical. Ignore not safe for work texts.
 
     Output Format:
-    1. Input Query: {query}
+    1. Input Query: {{query}}
     2. Source Links Referenced for Analysis
     3. Leaked Corporate Artifacts (credentials, documents, source code, databases)
     4. Threat Actor / Broker Activity
