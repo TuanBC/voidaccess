@@ -271,14 +271,18 @@ def export_sigma_rules(
 
 
 def _load_entities_for_investigation(investigation_id: Any) -> list[Any]:
-    """Load NormalizedEntity list from DB. Returns [] on error."""
+    """Load NormalizedEntity list from DB for this investigation.
+
+    Includes entities owned directly AND entities linked via InvestigationEntityLink.
+    Returns [] on error.
+    """
     if not os.getenv("DATABASE_URL"):
         return []
 
     try:
-        import uuid as _uuid  # noqa: PLC0415
         from db.session import get_session  # noqa: PLC0415
-        from db.queries import get_entities_for_investigation  # noqa: PLC0415
+        from db.queries import get_investigation_by_id_or_run  # noqa: PLC0415
+        from db.models import Entity, InvestigationEntityLink  # noqa: PLC0415
         from extractor.normalizer import NormalizedEntity  # noqa: PLC0415
 
         inv_uuid = _coerce_uuid(investigation_id)
@@ -286,25 +290,41 @@ def _load_entities_for_investigation(investigation_id: Any) -> list[Any]:
             return []
 
         with get_session() as session:
-            db_entities = get_entities_for_investigation(session, inv_uuid)
+            inv = get_investigation_by_id_or_run(session, inv_uuid)
+            if inv is None:
+                return []
 
-        result: list[NormalizedEntity] = []
-        for e in db_entities:
-            source_url = ""
-            try:
-                if e.page:
-                    source_url = e.page.url or ""
-            except Exception:
-                pass
-            result.append(NormalizedEntity(
-                entity_type=e.entity_type,
-                value=e.value,
-                confidence=e.confidence,
-                source_url=source_url,
-                page_id=e.page_id,
-                context=e.context or "",
-            ))
-        return result
+            linked_ids_subq = (
+                session.query(InvestigationEntityLink.entity_id)
+                .filter(InvestigationEntityLink.investigation_id == inv.id)
+                .subquery()
+            )
+            db_entities = (
+                session.query(Entity)
+                .filter(
+                    (Entity.investigation_id == inv.id)
+                    | Entity.id.in_(linked_ids_subq)
+                )
+                .all()
+            )
+
+            result: list[NormalizedEntity] = []
+            for e in db_entities:
+                source_url = ""
+                try:
+                    if e.page:
+                        source_url = e.page.url or ""
+                except Exception:
+                    pass
+                result.append(NormalizedEntity(
+                    entity_type=e.entity_type,
+                    value=e.canonical_value or e.value,
+                    confidence=e.confidence,
+                    source_url=source_url,
+                    page_id=e.page_id,
+                    context_snippet=e.context_snippet or "",
+                ))
+            return result
 
     except Exception as exc:
         logger.warning("sigma _load_entities_for_investigation failed: %s", exc)

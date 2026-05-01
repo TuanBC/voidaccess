@@ -110,6 +110,11 @@ COPY --chown=voidaccess:voidaccess . .
 # (ChromaDB creates it at runtime; pre-creating avoids root-ownership from bind mounts)
 RUN mkdir -p /app/chroma_db && chown -R voidaccess:voidaccess /app/chroma_db
 
+# Ensure data directory exists for monitors.yaml and other runtime-written files.
+# This directory is mounted as a named Docker volume in docker-compose so it is
+# always writable by the voidaccess user regardless of the host bind-mount.
+RUN mkdir -p /app/data && chown -R voidaccess:voidaccess /app/data
+
 # Download spaCy model at runtime if not present (defer to first run)
 RUN python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null || \
     python -m spacy download en_core_web_sm

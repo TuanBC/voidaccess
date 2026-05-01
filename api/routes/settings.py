@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import select as sa_select
 
-from api.auth import get_current_user, CurrentUser
+from api.auth import get_current_user, require_password_not_reset_pending, CurrentUser
 from db.models import UserApiKey
 from db.session import get_async_session
 from utils.encryption import encrypt_api_key
@@ -141,7 +141,7 @@ async def get_api_keys(current_user: CurrentUser = Depends(get_current_user)) ->
 
 @router.post("/api-keys", response_model=UpsertKeyResponse)
 async def upsert_api_key(
-    body: UpsertKeyRequest, current_user: CurrentUser = Depends(get_current_user)
+    body: UpsertKeyRequest, current_user: CurrentUser = Depends(require_password_not_reset_pending)
 ) -> UpsertKeyResponse:
     if body.key_name not in ALLOWED_KEY_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown key_name: {body.key_name}")

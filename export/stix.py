@@ -287,6 +287,9 @@ def _load_entities_for_investigation(
     """
     Load entities from DB for the given investigation_id.
 
+    Includes entities owned directly by the investigation AND entities linked
+    via InvestigationEntityLink (canonical dedup junction table).
+
     Returns [] if DATABASE_URL is not set, investigation not found, or any error.
     """
     if not os.getenv("DATABASE_URL"):
@@ -294,8 +297,8 @@ def _load_entities_for_investigation(
 
     try:
         from db.session import get_session  # noqa: PLC0415
-        from db.queries import get_entities_for_investigation  # noqa: PLC0415
         from db.queries import get_investigation_by_id_or_run  # noqa: PLC0415
+        from db.models import Entity, InvestigationEntityLink  # noqa: PLC0415
         from extractor.normalizer import NormalizedEntity  # noqa: PLC0415
 
         inv_uuid = _coerce_uuid(investigation_id)
@@ -306,29 +309,40 @@ def _load_entities_for_investigation(
             inv = get_investigation_by_id_or_run(session, inv_uuid)
             if inv is None:
                 return []
-            db_entities = get_entities_for_investigation(session, inv.id)
+
+            linked_ids_subq = (
+                session.query(InvestigationEntityLink.entity_id)
+                .filter(InvestigationEntityLink.investigation_id == inv.id)
+                .subquery()
+            )
+            q = session.query(Entity).filter(
+                (Entity.investigation_id == inv.id)
+                | Entity.id.in_(linked_ids_subq)
+            )
+            db_entities = q.all()
+
             if entity_ids is not None:
                 want = frozenset(entity_ids)
                 db_entities = [e for e in db_entities if e.id in want]
 
-        result: list[NormalizedEntity] = []
-        for e in db_entities:
-            source_url = ""
-            try:
-                if e.page:
-                    source_url = e.page.url or ""
-            except Exception:
-                pass
-            ne = NormalizedEntity(
-                entity_type=e.entity_type,
-                value=e.value,
-                confidence=e.confidence,
-                source_url=source_url,
-                page_id=e.page_id,
-                context_snippet=e.context_snippet or "",
-                extraction_method="db",
-            )
-            result.append(ne)
+            result: list[NormalizedEntity] = []
+            for e in db_entities:
+                source_url = ""
+                try:
+                    if e.page:
+                        source_url = e.page.url or ""
+                except Exception:
+                    pass
+                ne = NormalizedEntity(
+                    entity_type=e.entity_type,
+                    value=e.canonical_value or e.value,
+                    confidence=e.confidence,
+                    source_url=source_url,
+                    page_id=e.page_id,
+                    context_snippet=e.context_snippet or "",
+                    extraction_method="db",
+                )
+                result.append(ne)
         return result
 
     except Exception as exc:

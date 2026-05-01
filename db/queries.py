@@ -274,17 +274,28 @@ def _link_entity_to_investigation(
     """Link an entity to an investigation via InvestigationEntityLink."""
     from db.models import InvestigationEntityLink
 
-    # Check if already linked
+    # Check committed rows
     existing = session.query(InvestigationEntityLink).filter_by(
         entity_id=entity_id, investigation_id=investigation_id
     ).first()
+    if existing:
+        return
 
-    if not existing:
-        link = InvestigationEntityLink(
-            entity_id=entity_id,
-            investigation_id=investigation_id
-        )
-        session.add(link)
+    # Also check pending (unflushed) objects — autoflush=False means they won't
+    # appear in the query above, causing UNIQUE VIOLATION on batch flush.
+    for obj in session.new:
+        if (
+            isinstance(obj, InvestigationEntityLink)
+            and obj.entity_id == entity_id
+            and obj.investigation_id == investigation_id
+        ):
+            return
+
+    link = InvestigationEntityLink(
+        entity_id=entity_id,
+        investigation_id=investigation_id
+    )
+    session.add(link)
 
 
 def upsert_entity_canonical(

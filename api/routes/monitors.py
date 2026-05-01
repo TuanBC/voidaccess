@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from filelock import FileLock
 from pydantic import BaseModel
 
@@ -34,6 +34,7 @@ from db.queries import (
     get_monitor_stats,
     get_unacknowledged_alert_count,
 )
+from api.auth import require_password_not_reset_pending, CurrentUser
 from db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,11 @@ _scheduler = None
 
 
 def _get_monitor_config_path() -> Path:
-    """Get the path to monitors.yaml."""
-    return Path(__file__).resolve().parents[2] / "monitors.yaml"
+    """Get the path to monitors.yaml, configurable via MONITORS_CONFIG_PATH env var."""
+    env_path = os.getenv("MONITORS_CONFIG_PATH")
+    if env_path:
+        return Path(env_path)
+    return Path(__file__).resolve().parents[2] / "data" / "monitors.yaml"
 
 
 def _ensure_monitors_yaml_exists() -> None:
@@ -277,7 +281,10 @@ async def acknowledge_monitor_alerts(
 
 
 @router.post("")
-async def create_monitor(req: CreateMonitorRequest) -> dict:
+async def create_monitor(
+    req: CreateMonitorRequest,
+    current_user: CurrentUser = Depends(require_password_not_reset_pending),
+) -> dict:
     """Create a new watch and append it to monitors.yaml."""
     if req.type not in ("keyword", "url"):
         raise HTTPException(status_code=422, detail="type must be 'keyword' or 'url'")

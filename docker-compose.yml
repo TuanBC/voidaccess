@@ -80,6 +80,7 @@ services:
     volumes:
       - .:/app
       - chroma_data:/app/chroma_db
+      - monitors_data:/app/data
     networks:
       - voidaccess-net
     healthcheck:
@@ -111,6 +112,8 @@ volumes:
   postgres_data:
     driver: local
   chroma_data:
+    driver: local
+  monitors_data:
     driver: local
   tor_data:
     driver: local

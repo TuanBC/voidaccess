@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from typing import Callable
 
 from fastapi import FastAPI, Depends, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter
@@ -48,7 +49,15 @@ else:
 def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(
         status_code=429,
-        content={"detail": "Too many requests. Try again later."},
+        content={
+            "detail": "Too many requests. Please wait 60 seconds before retrying.",
+            "retry_after": 60,
+        },
+        headers={
+            "Retry-After": "60",
+            "X-RateLimit-Limit": "3",
+            "X-RateLimit-Window": "60s",
+        },
     )
 
 
@@ -181,6 +190,22 @@ app.add_middleware(
 if limiter is not None:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = []
+    for error in exc.errors():
+        field = ".".join(str(x) for x in error.get("loc", []) if x != "body")
+        msg = error.get("msg", "Invalid value")
+        errors.append(f"{field}: {msg}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "; ".join(errors),
+            "errors": errors,
+        },
+    )
 
 
 @app.exception_handler(Exception)

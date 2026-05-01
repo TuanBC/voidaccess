@@ -5,6 +5,7 @@ Load and validate monitor watch definitions from monitors.yaml.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,7 +16,10 @@ _TYPES = frozenset({"keyword", "url"})
 
 
 def _yaml_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "monitors.yaml"
+    env_path = os.getenv("MONITORS_CONFIG_PATH")
+    if env_path:
+        return Path(env_path)
+    return Path(__file__).resolve().parent.parent / "data" / "monitors.yaml"
 
 
 def _as_float(val: Any, default: Optional[float] = None) -> Optional[float]:

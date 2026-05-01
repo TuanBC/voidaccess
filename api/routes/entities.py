@@ -73,8 +73,10 @@ async def list_entities(
                     {
                         "id": str(e.id),
                         "entity_type": e.entity_type,
-                        "value": e.value,
+                        "canonical_value": e.canonical_value,
+                        "value": e.canonical_value or e.value,
                         "confidence": e.confidence,
+                        "context_snippet": e.context_snippet,
                         "context": e.context,
                         "investigation_id": str(e.investigation_id) if e.investigation_id else None,
                         "created_at": e.created_at.isoformat() if e.created_at else None,

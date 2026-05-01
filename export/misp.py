@@ -158,6 +158,9 @@ def _load_investigation_and_entities(
     """
     Load the investigation record and its entities from DB.
 
+    Includes entities owned directly by the investigation AND entities linked
+    via InvestigationEntityLink (canonical dedup junction table).
+
     Returns (investigation, entities) or (None, []) on error / not found.
     """
     import uuid as _uuid
@@ -167,8 +170,8 @@ def _load_investigation_and_entities(
 
     try:
         from db.session import get_session  # noqa: PLC0415
-        from db.queries import get_entities_for_investigation  # noqa: PLC0415
         from db.queries import get_investigation_by_id_or_run  # noqa: PLC0415
+        from db.models import Entity, InvestigationEntityLink  # noqa: PLC0415
         from extractor.normalizer import NormalizedEntity  # noqa: PLC0415
 
         inv_uuid = _coerce_uuid(investigation_id)
@@ -189,7 +192,20 @@ def _load_investigation_and_entities(
             if investigation is None:
                 return None, []
 
-            db_entities = get_entities_for_investigation(session, investigation.id)
+            linked_ids_subq = (
+                session.query(InvestigationEntityLink.entity_id)
+                .filter(InvestigationEntityLink.investigation_id == investigation.id)
+                .subquery()
+            )
+            db_entities = (
+                session.query(Entity)
+                .filter(
+                    (Entity.investigation_id == investigation.id)
+                    | Entity.id.in_(linked_ids_subq)
+                )
+                .all()
+            )
+
             if filter_uuids is not None:
                 want = frozenset(filter_uuids)
                 db_entities = [e for e in db_entities if e.id in want]
@@ -204,15 +220,14 @@ def _load_investigation_and_entities(
                     pass
                 ne = NormalizedEntity(
                     entity_type=e.entity_type,
-                    value=e.value,
+                    value=e.canonical_value or e.value,
                     confidence=e.confidence,
                     source_url=source_url,
                     page_id=e.page_id,
-                    context=e.context or "",
+                    context_snippet=e.context_snippet or "",
                 )
                 normalized.append(ne)
 
-            # Detach from session before returning
             session.expunge_all()
             return investigation, normalized
 

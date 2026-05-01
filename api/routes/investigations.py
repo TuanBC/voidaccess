@@ -22,11 +22,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from sqlalchemy import select as sa_select
 from crawler import crawl
 from sources.seeds import get_seeds
-from api.auth import get_current_user
+from api.auth import get_current_user, require_password_not_reset_pending
 import json
 
 logger = logging.getLogger(__name__)
@@ -76,9 +76,17 @@ STEP_LABELS = {
 
 
 class InvestigationRequest(BaseModel):
-    query: str
-    model: Optional[str] = None
+    query: str = Field(..., min_length=3, max_length=500, description="Search query (3-500 chars)")
+    model: str = Field(default="openrouter/deepseek/deepseek-chat", description="LLM model ID to use")
     run_crawler: bool = False
+
+    @validator("query")
+    def query_not_whitespace(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Query cannot be empty or whitespace")
+        if len(v.strip()) < 3:
+            raise ValueError("Query must be at least 3 characters")
+        return v.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +153,7 @@ def _get_db_investigation(investigation_id: str) -> Any:
                 "graph_status": getattr(inv, "graph_status", "pending"),
                 "created_at": inv.created_at.isoformat() if inv.created_at else None,
                 "current_step": inv.current_step or 0,
+                "total_steps": 13,
                 "current_step_label": inv.current_step_label or "",
                 "entity_count": entity_count,
                 "relationship_count": relationship_count,
@@ -950,7 +959,7 @@ async def create_investigation(
     request: Request,
     body: InvestigationRequest,
     background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_password_not_reset_pending),
 ) -> dict:
     """Trigger an investigation asynchronously.
 
@@ -1064,7 +1073,7 @@ async def investigation_progress(
     SSE stream of investigation pipeline progress.
     Emits step updates every 5 seconds until a terminal state is reached.
     """
-    from db.session import get_session
+    from db.session import get_async_session
     from db.models import Investigation
 
     try:
@@ -1072,41 +1081,55 @@ async def investigation_progress(
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid investigation ID format")
 
+    # Verify existence and ownership before opening the stream
+    async with get_async_session() as session:
+        result = await session.execute(sa_select(Investigation).where(Investigation.id == inv_uuid))
+        inv_check = result.scalar_one_or_none()
+    if inv_check is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    if str(inv_check.user_id) != str(current_user.user.id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     async def event_stream():
         last_step = None
         last_status = None
         timeout_count = 0
         max_timeout = 360
+        data: dict = {}
 
         while timeout_count < max_timeout:
             try:
-                with get_session() as session:
-                    inv = session.query(Investigation).filter_by(id=inv_uuid).first()
+                async with get_async_session() as session:
+                    result = await session.execute(
+                        sa_select(Investigation).where(Investigation.id == inv_uuid)
+                    )
+                    inv = result.scalar_one_or_none()
             except Exception:
                 break
 
             if inv is None:
+                yield f"data: {json.dumps({'error': 'not_found'})}\n\n"
                 break
 
-            current_step = getattr(inv, "current_step", 0) or 0
-            current_status = getattr(inv, "status", "unknown")
-            step_label = getattr(inv, "current_step_label", "") or ""
-            progress_pct = int((current_step / 13) * 100)
+            step = inv.current_step or 0
+            label = inv.current_step_label or ""
+            status = inv.status
 
-            if current_step != last_step or current_status != last_status:
+            if step != last_step or status != last_status:
                 data = {
-                    "step": current_step,
-                    "step_label": step_label,
-                    "progress": progress_pct,
-                    "status": current_status,
-                    "entity_count": getattr(inv, "entity_count", 0) or 0,
-                    "page_count": getattr(inv, "page_count", 0) or 0,
+                    "step": step,
+                    "total_steps": 13,
+                    "label": label,
+                    "progress": int((step / 13) * 100),
+                    "status": status,
+                    "entity_count": inv.entity_count or 0,
+                    "page_count": inv.page_count or 0,
                 }
                 yield f"data: {json.dumps(data)}\n\n"
-                last_step = current_step
-                last_status = current_status
+                last_step = step
+                last_status = status
 
-            if current_status in ("completed", "failed", "completed_no_results"):
+            if status in ("completed", "failed", "completed_no_results"):
                 yield f"data: {json.dumps({**data, 'done': True})}\n\n"
                 break
 
@@ -1114,11 +1137,6 @@ async def investigation_progress(
             await asyncio.sleep(5)
 
         yield ": stream closed\n\n"
-
-    with get_session() as session:
-        inv = session.query(Investigation).filter_by(id=inv_uuid).first()
-        if inv is None:
-            raise HTTPException(status_code=404, detail="Investigation not found")
 
     return StreamingResponse(
         event_stream(),
@@ -1278,7 +1296,7 @@ async def get_investigation(investigation_id: str) -> dict:
 async def get_investigation_entities(
     investigation_id: str,
     entity_type: Optional[str] = Query(default=None),
-    min_confidence: float = Query(default=0.0, ge=0.0, le=1.0),
+    min_confidence: float = Query(default=0.75, ge=0.0, le=1.0),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     defang: bool = Query(default=True),
@@ -1365,8 +1383,10 @@ async def get_investigation_entities(
                     {
                         "id": str(e.id),
                         "entity_type": e.entity_type,
+                        "canonical_value": e.canonical_value,
                         "value": display_value,
                         "confidence": e.confidence,
+                        "context_snippet": e.context_snippet,
                         "context": display_context,
                         "created_at": e.created_at.isoformat() if e.created_at else None,
                         "first_seen": e.first_seen.isoformat() if e.first_seen else None,

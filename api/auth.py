@@ -142,3 +142,22 @@ async def get_current_user(
         raise credentials_exception
 
     return CurrentUser(user=user, jti=token_payload.jti, exp=token_payload.exp)
+
+
+async def require_password_not_reset_pending(
+    current_user: CurrentUser = Depends(get_current_user),
+) -> CurrentUser:
+    """Dependency for resource-creating endpoints — blocks access when a password reset is required."""
+    if getattr(current_user.user, "must_reset_password", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "password_reset_required",
+                "message": (
+                    "You must change your password before continuing. "
+                    "Use POST /auth/reset-password"
+                ),
+                "code": "PASSWORD_RESET_REQUIRED",
+            },
+        )
+    return current_user

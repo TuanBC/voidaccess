@@ -43,9 +43,18 @@ async def export_stix(investigation_id: str) -> Response:
     """
     _validate_uuid(investigation_id)
     try:
-        from export.stix import investigation_to_stix_bundle, bundle_to_json  # noqa: PLC0415
+        from export.stix import investigation_to_stix_bundle, bundle_to_json, _load_entities_for_investigation  # noqa: PLC0415
 
         internal_id = _resolve_internal_investigation_id(investigation_id)
+        entities = _load_entities_for_investigation(str(internal_id))
+        if not entities:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No exportable entities found for this investigation. "
+                    "Ensure the investigation has completed successfully."
+                ),
+            )
         bundle = investigation_to_stix_bundle(str(internal_id))
         json_str = bundle_to_json(bundle)
         filename = f"voidaccess_{investigation_id}_stix.json"
@@ -72,8 +81,18 @@ async def export_misp(investigation_id: str) -> Response:
     _validate_uuid(investigation_id)
     try:
         from export.misp import investigation_to_misp_event, misp_event_to_json  # noqa: PLC0415
+        from export.stix import _load_entities_for_investigation  # noqa: PLC0415
 
         internal_id = _resolve_internal_investigation_id(investigation_id)
+        entities = _load_entities_for_investigation(str(internal_id))
+        if not entities:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No exportable entities found for this investigation. "
+                    "Ensure the investigation has completed successfully."
+                ),
+            )
         event = investigation_to_misp_event(str(internal_id))
         json_str = misp_event_to_json(event)
         filename = f"voidaccess_{investigation_id}_misp.json"
@@ -107,7 +126,23 @@ async def export_sigma(investigation_id: str) -> StreamingResponse:
 
         internal_id = _resolve_internal_investigation_id(investigation_id)
         entities = _load_entities_for_investigation(str(internal_id))
+        if not entities:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No exportable entities found for this investigation. "
+                    "Ensure the investigation has completed successfully."
+                ),
+            )
         rules = entities_to_sigma_rules(entities)
+        if not rules:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No Sigma-compatible entities found (requires IP_ADDRESS, "
+                    "ONION_URL, CVE_NUMBER, MALWARE_FAMILY, or RANSOMWARE_GROUP)."
+                ),
+            )
 
         # Build zip in memory
         buf = io.BytesIO()
