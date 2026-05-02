@@ -11,7 +11,7 @@
 
 ---
 
-## ⚡ The OSINT Powerhouse
+## The OSINT Powerhouse
 
 Commercial threat intelligence platforms often charge prohibitive annual fees for capabilities that can be run on private hardware. **VoidAccess** democratizes high-end dark web intelligence by providing an automated, end-to-end workflow:
 
@@ -23,7 +23,7 @@ Commercial threat intelligence platforms often charge prohibitive annual fees fo
 
 ---
 
-## 🖼️ Visual Walkthrough
+## Visual Walkthrough
 
 ### 1. Intuitive Dashboard
 Start investigations with a clean, dark-themed interface designed for high-stakes research.
@@ -47,7 +47,7 @@ Get structured summaries and actionable artifacts once the scan completes.
 
 ---
 
-## 🛠️ How It Works (The 13-Step Pipeline)
+## How It Works (The 13-Step Pipeline)
 
 VoidAccess handles the complexity of dark web research through a rigorous sequence:
 
@@ -67,7 +67,7 @@ VoidAccess handles the complexity of dark web research through a rigorous sequen
 
 ---
 
-## 🔍 What It Extracts
+## What It Extracts
 
 The extraction pipeline identifies these entity types:
 
@@ -101,7 +101,7 @@ Export formats:
 
 ---
 
-## 🔌 LLM & Enrichment Ecosystem
+## LLM & Enrichment Ecosystem
 
 ### Supported LLM Providers
 
@@ -118,7 +118,7 @@ The default is **DeepSeek via OpenRouter** — under $0.50 per investigation, fa
 
 ---
 
-## 💰 Cost Comparison
+## Cost Comparison
 
 | Platform | Annual Cost | Self-Hosted | Open Source |
 |---|---|---|---|
@@ -131,7 +131,7 @@ Under $10 for 100 investigations using free-tier LLMs.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Docker and Docker Compose
@@ -198,7 +198,7 @@ The investigation starts in `pending`, moves to `processing`, and completes in 3
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 Four Docker services:
 
@@ -213,7 +213,7 @@ The FastAPI backend runs a 13-step pipeline triggered by `POST /investigations`.
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 **Services won't start:**
 ```bash
@@ -233,19 +233,19 @@ docker compose -f infra/docker-compose.yml --project-directory . logs -f
 
 ---
 
-## 🛡️ Content Safety
+## Content Safety
 
 Every investigation runs through mandatory content safety filters before results reach the UI or appear in the graph. CSAM, gore, snuff content, and other prohibited material are blocked at the query stage, URL validation, content scanning, and post-extraction entity filtering. These filters are mandatory and cannot be disabled.
 
 ---
 
-## ⚖️ Acceptable Use
+## Acceptable Use
 
 VoidAccess is for authorized security research, threat intelligence gathering, and law enforcement purposes only. Users are responsible for ensuring compliance with all local laws and ethical standards. See [docs/USAGE_POLICY.md](docs/USAGE_POLICY.md) for the full policy.
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for setup instructions, code standards, and the PR process. Please read [docs/CODE_OF_CONDUCT.md](docs/CODE_OF_CONDUCT.md) before participating.
 
@@ -253,6 +253,6 @@ To report a security vulnerability, see [docs/SECURITY.md](docs/SECURITY.md).
 
 ---
 
-## 📄 License
+## License
 
 MIT License. See [LICENSE](LICENSE) for details.
