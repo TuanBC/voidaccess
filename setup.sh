@@ -2,8 +2,6 @@
 # VoidAccess Interactive Setup Wizard
 # Works on macOS (zsh/bash), Ubuntu/Debian (bash), and Windows Git Bash/WSL
 
-set -e
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -15,6 +13,20 @@ CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
+
+find_compose() {
+    if [ -f "infra/docker-compose.yml" ]; then
+        echo "infra/docker-compose.yml"
+    elif [ -f "docker-compose.yml" ]; then
+        echo "docker-compose.yml"
+    else
+        printf "  ${RED}✗${NC}  docker-compose.yml not found\n" >&2
+        exit 1
+    fi
+}
+COMPOSE_FILE=$(find_compose)
+COMPOSE_CMD="docker compose -f $COMPOSE_FILE \
+    --project-directory ."
 
 print_ok()   { printf "${GREEN}  ✓${NC}  %s\n" "$1"; }
 print_fail() { printf "${RED}  ✗${NC}  %s\n" "$1"; }
@@ -572,35 +584,27 @@ print_step "6" "Redis"
 
 print_info "Redis enables JWT token revocation and circuit breaker state."
 print_info "Recommended for production deployments. Skip for local/dev use."
+
 printf "\n"
-printf "  ${CYAN}▸${NC}  Is Redis available? [y/${BOLD}N${NC}]: "
+printf "  ${DIM}→${NC}  Redis enables JWT token "
+printf "revocation and circuit breaker state.\n"
+printf "  ${DIM}→${NC}  Recommended for production. "
+printf "Skip for local / dev use.\n\n"
+printf "  ${CYAN}▸${NC}  Enable Redis? [y/${BOLD}N${NC}]: "
+read -r redis_ans </dev/tty || redis_ans="n"
+redis_ans="${redis_ans:-n}"
 
-read -r redis_answer || redis_answer="n"
-
-if [ "$redis_answer" = "y" ] || [ "$redis_answer" = "Y" ]; then
-    printf "  ${CYAN}▸${NC}  Redis URL [redis://localhost:6379/0]: "
-    read -r redis_url || redis_url=""
+if [[ "${redis_ans,,}" == "y" ]]; then
+    printf "  ${CYAN}▸${NC}  Redis URL "
+    printf "[redis://localhost:6379/0]: "
+    read -r redis_url </dev/tty || redis_url=""
     redis_url="${redis_url:-redis://localhost:6379/0}"
-
-    print_info "Testing Redis connection..."
-    if python3 -c "
-import sys
-try:
-    import redis
-    r = redis.from_url('$redis_url')
-    r.ping()
-    sys.exit(0)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
-        printf "  ${GREEN}✓${NC}  Redis connected\n"
-        env_update "REDIS_URL" "$redis_url"
-    else
-        printf "  ${YELLOW}⚠${NC}  Could not connect to Redis at $redis_url\n"
-        print_info "Continuing without Redis"
-    fi
+    grep -q "^REDIS_URL=" .env 2>/dev/null && \
+        sed -i "s|^REDIS_URL=.*|REDIS_URL=$redis_url|" \
+        .env || echo "REDIS_URL=$redis_url" >> .env
+    printf "  ${GREEN}✓${NC}  Redis configured\n"
 else
-    print_info "Skipping Redis — logout tokens valid until expiry"
+    printf "  ${DIM}→${NC}  Skipped\n"
 fi
 
 # =============================================================================
@@ -608,38 +612,29 @@ fi
 # =============================================================================
 print_step "7" "MITRE ATT&CK Cache"
 
-print_info "Pre-seeding MITRE ATT&CK database (~33MB, one-time download)"
-print_info "This improves threat actor enrichment quality."
 printf "\n"
+printf "  ${CYAN}▸${NC}  Download MITRE ATT&CK database "
+printf "now? (~33MB) [${BOLD}Y${NC}/n]: "
+read -r mitre_ans </dev/tty || mitre_ans="y"
+mitre_ans="${mitre_ans:-y}"
 
-response="$(wait_for_key "Download MITRE ATT&CK now" "Y")"
-if [ "$response" != "N" ] && [ "$response" != "n" ]; then
-    MITRE_TMP="/tmp/voidaccess_mitre_attack.json"
-
+if [[ "${mitre_ans,,}" != "n" ]]; then
+    printf "  ${DIM}→${NC}  Downloading...\n"
     python3 -c "
 import urllib.request, sys
-url = 'https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json'
 try:
-    urllib.request.urlretrieve(url, '$MITRE_TMP')
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" &
-    MITRE_PID=$!
-    spin $MITRE_PID "Downloading MITRE ATT&CK STIX data (~33MB)..."
-    wait $MITRE_PID
-    MITRE_EXIT=$?
-
-    if [ $MITRE_EXIT -eq 0 ]; then
-        if [ -f "$MITRE_TMP" ]; then
-            mkdir -p "$SCRIPT_DIR/cti_data" 2>/dev/null
-            cp "$MITRE_TMP" "$SCRIPT_DIR/cti_data/enterprise-attack.json"
-            rm -f "$MITRE_TMP"
-        fi
-        printf "  ${GREEN}✓${NC}  MITRE ATT&CK cache ready\n"
-    else
-        printf "  ${YELLOW}⚠${NC}  Download failed — will retry on first investigation\n"
-    fi
+    urllib.request.urlretrieve(
+        'https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json',
+        '/tmp/voidaccess_mitre_attack.json'
+    )
+    print('  \033[0;32m✓\033[0m  Download complete')
+except Exception as e:
+    print(f'  \033[1;33m⚠\033[0m  Download failed: {e}')
+    print('  \033[2m→\033[0m  Will retry on first investigation')
+" 2>/dev/null || \
+    printf "  ${YELLOW}⚠${NC}  Download failed — will retry later\n"
+else
+    printf "  ${DIM}→${NC}  Skipped — will download on first use\n"
 fi
 
 # =============================================================================
@@ -647,67 +642,72 @@ fi
 # =============================================================================
 print_step "8" "Start Stack"
 
-print_info "Ready to start VoidAccess?"
 printf "\n"
-printf "  ${DIM}Services: PostgreSQL, Tor, FastAPI, Next.js${NC}\n"
-printf "  ${DIM}This will take 3-5 minutes on first run.${NC}\n"
-printf "\n"
+printf "  ${CYAN}▸${NC}  Start VoidAccess now? "
+printf "[${BOLD}Y${NC}/n]: "
+read -r start_ans </dev/tty || start_ans="y"
+start_ans="${start_ans:-y}"
 
-response="$(wait_for_key "Start now" "Y")"
-if [ "$response" = "N" ] || [ "$response" = "n" ]; then
-    print_info "OK — start manually with: bash run.sh"
-    exit 0
-fi
-
-printf "\n"
-
-print_info "This takes 3-5 min on first run (cached after that)"
-printf "\n"
-
-DOCKER_BUILDKIT=1 docker compose -f infra/docker-compose.yml \
-    --project-directory . \
-    --env-file .env \
-    up --build -d > /tmp/va_build.log 2>&1 &
-BUILD_PID=$!
-spin $BUILD_PID "Building containers (grab a coffee)..."
-wait $BUILD_PID
-BUILD_EXIT=$?
-
-if [ $BUILD_EXIT -ne 0 ]; then
-    printf "  ${RED}✗${NC}  Build failed\n"
-    printf "  ${DIM}→${NC}  Details: cat /tmp/va_build.log\n"
-    tail -5 /tmp/va_build.log
-    exit 1
-fi
-printf "  ${GREEN}✓${NC}  Containers built\n\n"
-
-SERVICES=("postgres" "tor" "fastapi" "nextjs")
-SERVICE_LABELS=("PostgreSQL" "Tor" "FastAPI" "Next.js")
-
-for i in "${!SERVICES[@]}"; do
-    SVC="${SERVICES[$i]}"
-    LABEL="${SERVICE_LABELS[$i]}"
-    READY=false
-
-    for attempt in $(seq 1 40); do
-        STATE=$(docker inspect \
-          --format='{{.State.Health.Status}}' \
-          "voidaccess-${SVC}" 2>/dev/null)
-
-        if [ "$STATE" = "healthy" ]; then
-            printf "  ${GREEN}✓${NC}  $LABEL\n"
-            READY=true
-            break
-        fi
-
-        printf "\r  ${CYAN}·${NC}  $LABEL — waiting..."
-        sleep 3
-    done
-
-    if [ "$READY" = "false" ]; then
-        printf "\r  ${YELLOW}⚠${NC}  $LABEL — taking longer than expected\n"
+if [[ "${start_ans,,}" == "n" ]]; then
+    printf "  ${DIM}→${NC}  Start later with: "
+    printf "${BOLD}sudo bash start.sh${NC}\n"
+else
+    printf "\n  ${DIM}→${NC}  Building and starting "
+    printf "(first run: 3-5 min)...\n\n"
+    
+    # Show docker output directly — 
+    # no background process, no spinner
+    # Users can see progress
+    $COMPOSE_CMD up --build -d
+    BUILD_EXIT=$?
+    
+    if [ $BUILD_EXIT -ne 0 ]; then
+        printf "\n  ${RED}✗${NC}  Build failed.\n"
+        printf "  ${DIM}→${NC}  Run manually to see "
+        printf "full output:\n"
+        printf "  ${DIM}   $COMPOSE_CMD up --build${NC}\n"
+        exit 1
     fi
-done
+    
+    printf "\n  ${DIM}→${NC}  Waiting for services...\n\n"
+    
+    # Poll services
+    for SVC in postgres tor fastapi nextjs; do
+        LABEL="$SVC"
+        case $SVC in
+            postgres) LABEL="PostgreSQL" ;;
+            tor)      LABEL="Tor" ;;
+            fastapi)  LABEL="FastAPI" ;;
+            nextjs)   LABEL="Next.js" ;;
+        esac
+        
+        for attempt in $(seq 1 40); do
+            STATE=$(docker inspect \
+                --format='{{.State.Status}}' \
+                "voidaccess-${SVC}" 2>/dev/null \
+                || echo "missing")
+            HEALTH=$(docker inspect \
+                --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                "voidaccess-${SVC}" 2>/dev/null \
+                || echo "none")
+            
+            if [ "$HEALTH" = "healthy" ] || \
+               { [ "$STATE" = "running" ] && \
+                 [ "$HEALTH" = "none" ]; }; then
+                printf "  ${GREEN}✓${NC}  $LABEL\n"
+                break
+            fi
+            
+            if [ $attempt -eq 40 ]; then
+                printf "  ${YELLOW}⚠${NC}  $LABEL slow to start\n"
+            else
+                printf "\r  ${CYAN}·${NC}  $LABEL (${attempt}/40)...   "
+                sleep 3
+            fi
+        done
+        printf "\r%-60s\r" " "
+    done
+fi
 
 # =============================================================================
 # STEP 9: Set Admin Password
@@ -757,8 +757,7 @@ fi
 
 if [ -n "$ADMIN_PASS" ]; then
     print_info "Setting admin password..."
-    HASH=$(docker compose -f infra/docker-compose.yml \
-        --project-directory . \
+    HASH=$($COMPOSE_CMD \
         --env-file .env \
         exec -T fastapi \
         python3 -c "
@@ -768,8 +767,7 @@ print(ctx.hash('$ADMIN_PASS'))
 " 2>/dev/null)
 
     if [ -n "$HASH" ]; then
-        docker compose -f infra/docker-compose.yml \
-            --project-directory . \
+        $COMPOSE_CMD \
             --env-file .env \
             exec -T postgres psql \
             -U voidaccess -d voidaccess -c \
