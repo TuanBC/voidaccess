@@ -116,6 +116,28 @@ echo.
 for /f "delims=" %%i in ('!PYTHON! -c "import secrets; print(secrets.token_hex(32))"') do set JWT_SECRET=%%i
 for /f "delims=" %%i in ('!PYTHON! -c "import secrets; print(secrets.token_hex(16))"') do set POSTGRES_PASSWORD=%%i
 
+:: Detect stale postgres volume from a prior failed/different setup.
+:: Docker volumes are global and persist across re-cloning, so a fresh .env
+:: + an existing voidaccess_postgres_data volume = fastapi auth failure.
+docker volume ls --format "{{.Name}}" | findstr /b /e "voidaccess_postgres_data" >nul 2>&1
+if not errorlevel 1 (
+    echo %YELLOW%  [^!^!]%NC%  Found existing 'voidaccess_postgres_data' volume.
+    echo   %DIM%-^>%NC%  Docker volumes survive re-cloning the repo.
+    echo   %DIM%-^>%NC%  The new password won't match -- fastapi will fail.
+    set /p WIPE_VOL=  Wipe stale voidaccess_* volumes and start fresh? [Y/n]:
+    if /i not "!WIPE_VOL!"=="n" (
+        echo %DIM%   -^>%NC%  Removing stale volumes...
+        docker compose -f infra\docker-compose.yml --project-directory "%~dp0" --env-file "%~dp0.env" down -v >nul 2>&1
+        docker volume rm -f voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data >nul 2>&1
+        echo %GREEN%  [OK]%NC%  Stale volumes removed.
+    ) else (
+        echo %RED%  [^!^!]%NC%  Cannot continue with stale volume -- fastapi would fail to authenticate.
+        echo   %DIM%-^>%NC%  Manual fix: docker volume rm voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data
+        pause
+        exit /b 1
+    )
+)
+
 call :env_set "JWT_SECRET" "!JWT_SECRET!"
 call :env_set "POSTGRES_PASSWORD" "!POSTGRES_PASSWORD!"
 echo %GREEN%  [OK]%NC%  Generated JWT_SECRET and POSTGRES_PASSWORD

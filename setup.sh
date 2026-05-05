@@ -314,14 +314,53 @@ else
     fi
 fi
 
-# If a postgres_data volume already exists, the running database was
-# initialized with OLD_POSTGRES_PASSWORD.  Generating a new password here
-# would make alembic fail to authenticate.  Reuse the old one instead.
+# Handle pre-existing voidaccess_postgres_data volume.
+#
+# Docker volumes are global — they survive `git clone` into a new directory.
+# If a previous setup.sh run created the volume, postgres was initialized with
+# THAT password. The new password we just generated won't authenticate, and
+# fastapi's entrypoint will exit 1 after a 30s retry window. Catch that here.
+#
+#   - If we have OLD_POSTGRES_PASSWORD (preserved from existing .env): reuse it.
+#   - If volume exists but OLD is empty (.env was wiped or this is a re-clone):
+#     the volume is unrecoverable. Offer to wipe before we waste a 5-min build.
+HAS_PG_VOLUME=false
 if docker volume ls --format '{{.Name}}' 2>/dev/null \
-        | grep -qxF "voidaccess_postgres_data" \
-        && [ -n "$OLD_POSTGRES_PASSWORD" ]; then
-    POSTGRES_PASSWORD="$OLD_POSTGRES_PASSWORD"
-    print_info "Existing database volume detected — preserving PostgreSQL password"
+        | grep -qxF "voidaccess_postgres_data"; then
+    HAS_PG_VOLUME=true
+fi
+
+if [ "$HAS_PG_VOLUME" = "true" ]; then
+    if [ -n "$OLD_POSTGRES_PASSWORD" ]; then
+        POSTGRES_PASSWORD="$OLD_POSTGRES_PASSWORD"
+        print_info "Existing database volume detected — preserving PostgreSQL password"
+    else
+        printf "\n"
+        print_warn "Found 'voidaccess_postgres_data' volume from a previous setup,"
+        print_warn "but no recoverable POSTGRES_PASSWORD (no prior .env on disk)."
+        print_info "Docker volumes are global — they persist across re-cloning the repo."
+        print_info "The fastapi container will fail to authenticate against this volume."
+        printf "\n"
+        response="$(wait_for_key "Wipe stale volumes and start fresh?" "Y")"
+        if [ -z "$response" ] || [ "$response" = "Y" ] || [ "$response" = "y" ]; then
+            print_info "Removing stale voidaccess_* volumes..."
+            # Best-effort: bring down anything still attached, then nuke volumes.
+            $COMPOSE_CMD down -v >/dev/null 2>&1 || true
+            docker volume rm -f \
+                voidaccess_postgres_data \
+                voidaccess_chroma_data \
+                voidaccess_monitors_data \
+                voidaccess_tor_data >/dev/null 2>&1 || true
+            print_ok "Stale volumes removed — proceeding with fresh password"
+        else
+            print_fail "Cannot continue — fastapi would fail to authenticate."
+            print_info "Either wipe manually:"
+            printf "    ${DIM}docker volume rm voidaccess_postgres_data \\
+        voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data${NC}\n"
+            print_info "Or restore the .env that matches the existing volume's password."
+            exit 1
+        fi
+    fi
 fi
 
 env_update "JWT_SECRET" "$JWT_SECRET"
