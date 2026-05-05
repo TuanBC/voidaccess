@@ -527,7 +527,6 @@ export function GraphVisualization({
       labelSize:                  15,
       labelWeight:                "600",
       labelColor:                 { color: "#FFFFFF" },
-      defaultLabelColor:          "#FFFFFF",
       defaultNodeColor:           "#4a5260",
       defaultEdgeColor:           EDGE_DEFAULT,
       stagePadding:               90,

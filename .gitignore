@@ -252,3 +252,10 @@ ai_notes.md
 tests/
 web/__tests__/
 web/middleware.test.ts
+
+# Missing artifacts from code audit
+/tmp/va_*.log
+chroma_db/
+/data/seed_data.json.gz
+coverage/
+*.pytest_tmp
