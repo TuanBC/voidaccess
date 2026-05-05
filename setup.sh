@@ -114,21 +114,24 @@ env_append() {
 }
 
 wait_for_key() {
+    # Write only the captured answer to stdout. The prompt itself goes to
+    # stderr — otherwise `response="$(wait_for_key ...)"` swallows the prompt
+    # text into $response and every comparison against "Y"/"N" misfires.
     local prompt_text="$1"
     local default="${2:-}"
-    local yn_default=""
-    if [ "$default" = "Y" ] || [ "$default" = "y" ]; then
-        yn_default="Y/n"
-    elif [ "$default" = "N" ] || [ "$default" = "n" ]; then
-        yn_default="y/N"
-    else
-        yn_default="y/n"
+    local yn_default
+    case "$default" in
+        Y|y) yn_default="Y/n" ;;
+        N|n) yn_default="y/N" ;;
+        *)   yn_default="y/n" ;;
+    esac
+    printf "\n${CYAN}  ▸${NC}  %s [%s]: " "$prompt_text" "$yn_default" >&2
+    local answer=""
+    if ! read -r answer; then
+        answer=""
     fi
-    local response=""
-    printf "\n"
-    prompt "$prompt_text [$yn_default]: "
-    response="$(_prompt "" "$default")"
-    echo "$response"
+    answer="${answer:-$default}"
+    echo "$answer"
 }
 
 # =============================================================================
@@ -164,6 +167,123 @@ check_docker_permission() {
 }
 
 check_docker_permission
+
+# =============================================================================
+# Pre-flight: detect existing state, offer Start / Reset / Cancel.
+# =============================================================================
+# Without this, a re-clone or a half-finished prior run leaves stale state
+# (a .env, Docker volumes, leftover containers) that conflicts with a fresh
+# setup and doesn't surface until ~5 min into the build.
+ENV_FILE="$SCRIPT_DIR/.env"
+ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
+
+HAS_ENV=false
+HAS_VOLUMES=false
+HAS_CONTAINERS=false
+HAS_RUNNING=false
+
+[ -f "$ENV_FILE" ] && HAS_ENV=true
+
+if docker volume ls --format '{{.Name}}' 2>/dev/null \
+        | grep -qE '^voidaccess_(postgres_data|chroma_data|monitors_data|tor_data)$'; then
+    HAS_VOLUMES=true
+fi
+
+if docker ps -a --format '{{.Names}}' 2>/dev/null \
+        | grep -qE '^voidaccess-(postgres|tor|fastapi|nextjs)$'; then
+    HAS_CONTAINERS=true
+    if docker ps --format '{{.Names}}' 2>/dev/null \
+            | grep -qE '^voidaccess-(postgres|tor|fastapi|nextjs)$'; then
+        HAS_RUNNING=true
+    fi
+fi
+
+# Wipe everything voidaccess-related from Docker. Used by the "Reset" path
+# and by the safety-net mid-script.
+nuke_voidaccess_docker() {
+    docker rm -f voidaccess-postgres voidaccess-tor voidaccess-fastapi \
+        voidaccess-nextjs >/dev/null 2>&1 || true
+    docker volume rm -f voidaccess_postgres_data voidaccess_chroma_data \
+        voidaccess_monitors_data voidaccess_tor_data >/dev/null 2>&1 || true
+}
+
+if [ "$HAS_ENV" = "true" ] || [ "$HAS_VOLUMES" = "true" ] || [ "$HAS_CONTAINERS" = "true" ]; then
+    printf "\n${CYAN}  +-----------------------------------+${NC}\n"
+    printf   "${CYAN}  | ${BOLD}Existing setup detected${NC}            ${CYAN}|${NC}\n"
+    printf   "${CYAN}  +-----------------------------------+${NC}\n\n"
+
+    [ "$HAS_ENV" = "true" ]        && print_info ".env file:       present"
+    [ "$HAS_VOLUMES" = "true" ]    && print_info "Docker volumes:  present (database may have data)"
+    [ "$HAS_CONTAINERS" = "true" ] && {
+        if [ "$HAS_RUNNING" = "true" ]; then
+            print_info "Containers:      present (some running)"
+        else
+            print_info "Containers:      present (stopped)"
+        fi
+    }
+
+    printf "\n  ${BOLD}What would you like to do?${NC}\n\n"
+    printf "  ${CYAN}[1]${NC} ${BOLD}Start VoidAccess${NC}  ${DIM}— use existing config${NC}\n"
+    printf "      Skips configuration and runs ${BOLD}start.sh${NC}.\n"
+    printf "      ${DIM}Choose this if your setup was working before.${NC}\n\n"
+    printf "  ${CYAN}[2]${NC} ${BOLD}Reset and reconfigure${NC}  ${DIM}— clean slate${NC}\n"
+    printf "      Stops voidaccess containers, deletes voidaccess Docker volumes,\n"
+    printf "      removes .env, then runs the full setup wizard.\n"
+    printf "      ${DIM}Choose this if anything is broken or you want fresh API keys.${NC}\n\n"
+    printf "  ${CYAN}[3]${NC} ${BOLD}Cancel${NC}\n"
+    printf "      Exit without changes.\n\n"
+
+    while true; do
+        printf "${CYAN}  ▸${NC}  Choice [1-3]: " >&2
+        if ! read -r CHOICE_VAL; then CHOICE_VAL=""; fi
+        case "$CHOICE_VAL" in
+            1)
+                printf "\n"
+                print_info "Handing off to start.sh..."
+                printf "\n"
+                exec bash "$SCRIPT_DIR/start.sh"
+                ;;
+            2)
+                printf "\n"
+                print_warn "This will permanently delete:"
+                print_warn "  - voidaccess Docker volumes (postgres data, chroma, monitors, tor)"
+                print_warn "  - The current .env file"
+                print_warn "  - Any voidaccess containers"
+                printf "\n"
+                response="$(wait_for_key "Continue with reset?" "N")"
+                case "$response" in
+                    Y|y|YES|yes|Yes)
+                        print_info "Resetting..."
+                        # compose down handles things compose owns; nuke_* handles orphans
+                        $COMPOSE_CMD down -v >/dev/null 2>&1 || true
+                        nuke_voidaccess_docker
+                        rm -f "$ENV_FILE"
+                        # Reset state flags so the rest of the script behaves
+                        # as if this were a clean machine.
+                        HAS_ENV=false
+                        HAS_VOLUMES=false
+                        HAS_CONTAINERS=false
+                        HAS_RUNNING=false
+                        print_ok "Reset complete — proceeding with fresh setup"
+                        printf "\n"
+                        break
+                        ;;
+                    *)
+                        print_info "Reset cancelled"
+                        ;;
+                esac
+                ;;
+            3)
+                printf "\n"
+                print_info "Cancelled. To start manually: ${BOLD}bash start.sh${NC}"
+                exit 0
+                ;;
+            *)
+                print_warn "Invalid choice — enter 1, 2, or 3"
+                ;;
+        esac
+    done
+fi
 
 # =============================================================================
 # STEP 1: Prerequisites Check
@@ -263,29 +383,13 @@ fi
 # =============================================================================
 print_step "2" "Environment"
 
-ENV_FILE="$SCRIPT_DIR/.env"
-ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
-OVERWRITE=false
-
-# Save existing password BEFORE overwriting — needed to preserve compatibility
-# with an existing postgres_data volume (which only knows the original password).
-OLD_POSTGRES_PASSWORD=""
+# Pre-flight already handled the existing-.env case (Reset deleted it,
+# Start exited, Cancel exited). If a .env still exists here it means the
+# user somehow created one out of band — back it up rather than losing it.
 if [ -f "$ENV_FILE" ]; then
-    OLD_POSTGRES_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)
-fi
-
-if [ -f "$ENV_FILE" ]; then
-    print_info "A .env file already exists."
-    response="$(wait_for_key "Overwrite" "N")"
-    if [ "$response" = "Y" ] || [ "$response" = "y" ]; then
-        OVERWRITE=true
-        print_info "Overwriting existing .env"
-    else
-        print_info "Keeping existing .env — skipping configuration."
-        printf "\n"
-        print_warn "To re-run setup, delete or rename .env and run setup.sh again."
-        exit 0
-    fi
+    BACKUP="$ENV_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+    mv "$ENV_FILE" "$BACKUP"
+    print_warn "Existing .env backed up to: $(basename "$BACKUP")"
 fi
 
 if [ -f "$ENV_EXAMPLE" ]; then
@@ -314,53 +418,13 @@ else
     fi
 fi
 
-# Handle pre-existing voidaccess_postgres_data volume.
-#
-# Docker volumes are global — they survive `git clone` into a new directory.
-# If a previous setup.sh run created the volume, postgres was initialized with
-# THAT password. The new password we just generated won't authenticate, and
-# fastapi's entrypoint will exit 1 after a 30s retry window. Catch that here.
-#
-#   - If we have OLD_POSTGRES_PASSWORD (preserved from existing .env): reuse it.
-#   - If volume exists but OLD is empty (.env was wiped or this is a re-clone):
-#     the volume is unrecoverable. Offer to wipe before we waste a 5-min build.
-HAS_PG_VOLUME=false
+# Safety net: pre-flight should have already wiped stale volumes via the
+# Reset path. If a postgres volume snuck back in (race, manual creation,
+# bug), nuke it now — the new password won't authenticate against it.
 if docker volume ls --format '{{.Name}}' 2>/dev/null \
         | grep -qxF "voidaccess_postgres_data"; then
-    HAS_PG_VOLUME=true
-fi
-
-if [ "$HAS_PG_VOLUME" = "true" ]; then
-    if [ -n "$OLD_POSTGRES_PASSWORD" ]; then
-        POSTGRES_PASSWORD="$OLD_POSTGRES_PASSWORD"
-        print_info "Existing database volume detected — preserving PostgreSQL password"
-    else
-        printf "\n"
-        print_warn "Found 'voidaccess_postgres_data' volume from a previous setup,"
-        print_warn "but no recoverable POSTGRES_PASSWORD (no prior .env on disk)."
-        print_info "Docker volumes are global — they persist across re-cloning the repo."
-        print_info "The fastapi container will fail to authenticate against this volume."
-        printf "\n"
-        response="$(wait_for_key "Wipe stale volumes and start fresh?" "Y")"
-        if [ -z "$response" ] || [ "$response" = "Y" ] || [ "$response" = "y" ]; then
-            print_info "Removing stale voidaccess_* volumes..."
-            # Best-effort: bring down anything still attached, then nuke volumes.
-            $COMPOSE_CMD down -v >/dev/null 2>&1 || true
-            docker volume rm -f \
-                voidaccess_postgres_data \
-                voidaccess_chroma_data \
-                voidaccess_monitors_data \
-                voidaccess_tor_data >/dev/null 2>&1 || true
-            print_ok "Stale volumes removed — proceeding with fresh password"
-        else
-            print_fail "Cannot continue — fastapi would fail to authenticate."
-            print_info "Either wipe manually:"
-            printf "    ${DIM}docker volume rm voidaccess_postgres_data \\
-        voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data${NC}\n"
-            print_info "Or restore the .env that matches the existing volume's password."
-            exit 1
-        fi
-    fi
+    print_warn "Stale postgres volume detected after pre-flight — wiping"
+    nuke_voidaccess_docker
 fi
 
 env_update "JWT_SECRET" "$JWT_SECRET"

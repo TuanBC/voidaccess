@@ -42,6 +42,96 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: ===========================================================================
+:: Pre-flight: detect existing state, offer Start / Reset / Cancel.
+:: ===========================================================================
+:: Without this, a re-clone or a half-finished prior run leaves stale state
+:: (a .env, Docker volumes, leftover containers) that conflicts with a fresh
+:: setup and doesn't surface until ~5 min into the build.
+set HAS_ENV=0
+set HAS_VOLUMES=0
+set HAS_CONTAINERS=0
+
+if exist "%~dp0.env" set HAS_ENV=1
+
+for /f %%V in ('docker volume ls --format "{{.Name}}" 2^>nul ^| findstr /r "^voidaccess_postgres_data$ ^voidaccess_chroma_data$ ^voidaccess_monitors_data$ ^voidaccess_tor_data$"') do set HAS_VOLUMES=1
+
+for /f %%C in ('docker ps -a --format "{{.Names}}" 2^>nul ^| findstr /r "^voidaccess-postgres$ ^voidaccess-tor$ ^voidaccess-fastapi$ ^voidaccess-nextjs$"') do set HAS_CONTAINERS=1
+
+if !HAS_ENV!==0 if !HAS_VOLUMES!==0 if !HAS_CONTAINERS!==0 goto SKIP_PREFLIGHT
+
+echo.
+echo %CYAN%  +-----------------------------------+%NC%
+echo %CYAN%  ^|%NC%  %BOLD%Existing setup detected%NC%            %CYAN%^|%NC%
+echo %CYAN%  +-----------------------------------+%NC%
+echo.
+if !HAS_ENV!==1        echo %DIM%   -^>%NC%  .env file:       present
+if !HAS_VOLUMES!==1    echo %DIM%   -^>%NC%  Docker volumes:  present (database may have data)
+if !HAS_CONTAINERS!==1 echo %DIM%   -^>%NC%  Containers:      present
+echo.
+echo   %BOLD%What would you like to do?%NC%
+echo.
+echo   %CYAN%[1]%NC% %BOLD%Start VoidAccess%NC%  %DIM%-- use existing config%NC%
+echo       Skips configuration and runs %BOLD%start.bat%NC%.
+echo       %DIM%Choose this if your setup was working before.%NC%
+echo.
+echo   %CYAN%[2]%NC% %BOLD%Reset and reconfigure%NC%  %DIM%-- clean slate%NC%
+echo       Stops voidaccess containers, deletes voidaccess Docker volumes,
+echo       removes .env, then runs the full setup wizard.
+echo       %DIM%Choose this if anything is broken or you want fresh API keys.%NC%
+echo.
+echo   %CYAN%[3]%NC% %BOLD%Cancel%NC%
+echo       Exit without changes.
+echo.
+
+:PREFLIGHT_PROMPT
+set PREFLIGHT_CHOICE=
+set /p PREFLIGHT_CHOICE=  Choice [1-3]:
+if "!PREFLIGHT_CHOICE!"=="1" goto PREFLIGHT_START
+if "!PREFLIGHT_CHOICE!"=="2" goto PREFLIGHT_RESET
+if "!PREFLIGHT_CHOICE!"=="3" goto PREFLIGHT_CANCEL
+echo %YELLOW%  [^!^!]%NC%  Invalid choice -- enter 1, 2, or 3
+goto PREFLIGHT_PROMPT
+
+:PREFLIGHT_START
+echo.
+echo %DIM%   -^>%NC%  Handing off to start.bat...
+echo.
+call "%~dp0start.bat"
+exit /b !errorlevel!
+
+:PREFLIGHT_RESET
+echo.
+echo %YELLOW%  [^!^!]%NC%  This will permanently delete:
+echo %YELLOW%  [^!^!]%NC%    - voidaccess Docker volumes (postgres data, chroma, monitors, tor)
+echo %YELLOW%  [^!^!]%NC%    - The current .env file
+echo %YELLOW%  [^!^!]%NC%    - Any voidaccess containers
+echo.
+set RESET_CONFIRM=
+set /p RESET_CONFIRM=  Continue with reset? [y/N]:
+if /i not "!RESET_CONFIRM!"=="y" (
+    echo %DIM%   -^>%NC%  Reset cancelled
+    goto PREFLIGHT_PROMPT
+)
+echo %DIM%   -^>%NC%  Resetting...
+docker compose -f "%~dp0infra\docker-compose.yml" --project-directory "%~dp0" down -v >nul 2>&1
+docker rm -f voidaccess-postgres voidaccess-tor voidaccess-fastapi voidaccess-nextjs >nul 2>&1
+docker volume rm -f voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data >nul 2>&1
+if exist "%~dp0.env" del /q "%~dp0.env"
+set HAS_ENV=0
+set HAS_VOLUMES=0
+set HAS_CONTAINERS=0
+echo %GREEN%  [OK]%NC%  Reset complete -- proceeding with fresh setup
+echo.
+goto SKIP_PREFLIGHT
+
+:PREFLIGHT_CANCEL
+echo.
+echo %DIM%   -^>%NC%  Cancelled. To start manually: %BOLD%start.bat%NC%
+exit /b 0
+
+:SKIP_PREFLIGHT
+
 :: -- STEP 1: Prerequisites -----------------------------------------------------
 echo.
 echo %CYAN%  +-----------------------------------+%NC%
@@ -87,26 +177,24 @@ echo %CYAN%  ^|%NC%  %BOLD%  2 / 7  -  Environment%NC%
 echo %CYAN%  +-----------------------------------+%NC%
 echo.
 
-if exist ".env" (
-    echo %DIM%   ->%NC%  A .env file already exists.
-    set /p OVERWRITE=    Overwrite? [y/N]:
-    if /i "!OVERWRITE!" neq "y" (
-        echo %DIM%   -^>%NC%  Keeping existing .env.
-        goto STEP3
-    )
+:: Pre-flight already handled the existing-.env case (Reset deleted it,
+:: Start exited, Cancel exited). If a .env is still here, back it up.
+if exist "%~dp0.env" (
+    set BACKUP=%~dp0.env.backup
+    move /y "%~dp0.env" "!BACKUP!" >nul
+    echo %YELLOW%  [^!^!]%NC%  Existing .env backed up to .env.backup
 )
 
-if exist ".env.example" (
-    copy /y ".env.example" ".env" >nul
+if exist "%~dp0.env.example" (
+    copy /y "%~dp0.env.example" "%~dp0.env" >nul
     echo %GREEN%  [OK]%NC%  Created .env from .env.example
 ) else (
-    type nul > ".env"
+    type nul > "%~dp0.env"
     echo %DIM%   -^>%NC%  Created empty .env
 )
 echo.
 
 :: -- STEP 3: Secrets -----------------------------------------------------------
-:STEP3
 echo.
 echo %CYAN%  +-----------------------------------+%NC%
 echo %CYAN%  ^|%NC%  %BOLD%  3 / 7  -  Secrets%NC%
@@ -116,26 +204,15 @@ echo.
 for /f "delims=" %%i in ('!PYTHON! -c "import secrets; print(secrets.token_hex(32))"') do set JWT_SECRET=%%i
 for /f "delims=" %%i in ('!PYTHON! -c "import secrets; print(secrets.token_hex(16))"') do set POSTGRES_PASSWORD=%%i
 
-:: Detect stale postgres volume from a prior failed/different setup.
-:: Docker volumes are global and persist across re-cloning, so a fresh .env
-:: + an existing voidaccess_postgres_data volume = fastapi auth failure.
-docker volume ls --format "{{.Name}}" | findstr /b /e "voidaccess_postgres_data" >nul 2>&1
+:: Safety net: pre-flight should have already wiped stale volumes via the
+:: Reset path. If a postgres volume snuck back in, nuke it now -- the new
+:: password won't authenticate against it.
+docker volume ls --format "{{.Name}}" 2>nul | findstr /r "^voidaccess_postgres_data$" >nul 2>&1
 if not errorlevel 1 (
-    echo %YELLOW%  [^!^!]%NC%  Found existing 'voidaccess_postgres_data' volume.
-    echo   %DIM%-^>%NC%  Docker volumes survive re-cloning the repo.
-    echo   %DIM%-^>%NC%  The new password won't match -- fastapi will fail.
-    set /p WIPE_VOL=  Wipe stale voidaccess_* volumes and start fresh? [Y/n]:
-    if /i not "!WIPE_VOL!"=="n" (
-        echo %DIM%   -^>%NC%  Removing stale volumes...
-        docker compose -f infra\docker-compose.yml --project-directory "%~dp0" --env-file "%~dp0.env" down -v >nul 2>&1
-        docker volume rm -f voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data >nul 2>&1
-        echo %GREEN%  [OK]%NC%  Stale volumes removed.
-    ) else (
-        echo %RED%  [^!^!]%NC%  Cannot continue with stale volume -- fastapi would fail to authenticate.
-        echo   %DIM%-^>%NC%  Manual fix: docker volume rm voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data
-        pause
-        exit /b 1
-    )
+    echo %YELLOW%  [^!^!]%NC%  Stale postgres volume detected after pre-flight -- wiping
+    docker compose -f "%~dp0infra\docker-compose.yml" --project-directory "%~dp0" down -v >nul 2>&1
+    docker rm -f voidaccess-postgres voidaccess-tor voidaccess-fastapi voidaccess-nextjs >nul 2>&1
+    docker volume rm -f voidaccess_postgres_data voidaccess_chroma_data voidaccess_monitors_data voidaccess_tor_data >nul 2>&1
 )
 
 call :env_set "JWT_SECRET" "!JWT_SECRET!"
