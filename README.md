@@ -6,7 +6,8 @@
 </div>
 
 <div align="center">
-  <video src="./public/how-it-works.mp4" width="100%" controls autoplay loop muted></video>
+  <img src="./public/setup_gif.gif" width="100%" alt="Setup walkthrough">
+  <img src="./public/start_gif.gif" width="100%" alt="Starting VoidAccess">
 </div>
 
 ---
@@ -107,14 +108,14 @@ Export formats:
 
 | Provider | Models | Notes |
 |---|---|---|
-| **OpenRouter** | DeepSeek, Llama 3.3, Claude Haiku, Gemini 2.0 | Recommended default; free models available |
+| **OpenRouter** | DeepSeek, Llama 3.3, Claude Haiku | Recommended default; free models available |
 | **Groq** | Llama 3.3, Llama 3.1 | Fast inference; free tier |
 | **OpenAI** | GPT-4o Mini | API key required |
-| **Anthropic** | Claude Haiku, Sonnet | API key required |
+| **Anthropic** | Claude Haiku | Haiku is the tested default; other models work via manual override. |
 | **Google Gemini** | Gemini 1.5 Flash, 2.5 Pro | Free tier via AI Studio |
 | **Ollama** | Any local model | Air-gapped; no API key needed |
 
-The default is **DeepSeek via OpenRouter** — under $0.50 per investigation, fast, and strong on technical security content. For fully air-gapped deployments, Ollama runs entirely locally.
+The default is **DeepSeek via OpenRouter** — fast and strong on technical security content. With free-tier LLMs (Groq free, OpenRouter free models, or Ollama) the cost is **$0**. With paid models like DeepSeek via OpenRouter it is **under $0.50 per investigation**. For fully air-gapped deployments, Ollama runs entirely locally.
 
 ---
 
@@ -127,7 +128,7 @@ The default is **DeepSeek via OpenRouter** — under $0.50 per investigation, fa
 | Flare | ~$8,000 | No | No |
 | **VoidAccess** | **Free** | **Yes** | **Yes** |
 
-Under $10 for 100 investigations using free-tier LLMs.
+Free with Groq, OpenRouter free models, or Ollama. Under $0.50 per investigation with paid models like DeepSeek.
 
 ---
 
@@ -135,29 +136,28 @@ Under $10 for 100 investigations using free-tier LLMs.
 
 ### Prerequisites
 - Docker and Docker Compose
+- Python 3 (recommended — used by setup.sh for secret generation; Linux/macOS fall back to /dev/urandom if absent, Windows setup.bat may require it)
 - One LLM API key — or Ollama for fully local operation (free)
 
 **Free LLM options (no credit card required):**
 - [Groq](https://console.groq.com) — fast, free tier, Llama 3.3 70B
 - [OpenRouter](https://openrouter.ai) — free models including DeepSeek and Llama 3.3
 - [Google AI Studio](https://aistudio.google.com) — Gemini free tier
-- [Ollama](https://ollama.com) — fully local, no internet required
+- [Ollama](https://ollama.ai) — fully local, no internet required
 
 ### Installation
 
 **macOS / Linux / WSL:**
 ```bash
-cp .env.example .env
 bash setup.sh
 ```
 
 **Windows (native):**
 ```bat
-copy .env.example .env
 setup.bat
 ```
 
-The interactive wizard will prompt for your LLM provider, generate secrets, and start the Docker stack.
+The interactive wizard creates `.env`, generates `JWT_SECRET` and `POSTGRES_PASSWORD`, prompts for your LLM provider (one of: Groq, OpenRouter, Anthropic, OpenAI, Google Gemini, or Ollama), optionally collects threat-intel keys (`OTX_API_KEY`, `VT_API_KEY`), optionally enables Redis, sets the admin password, and starts the Docker stack.
 
 ### Starting and Stopping
 
@@ -177,10 +177,12 @@ Once running, open **http://localhost:3001** in your browser.
 
 ### Getting a JWT (API access)
 
+`setup.sh` creates a default admin account at `admin@voidaccess.tech` with the password you provided during the wizard.
+
 ```bash
 curl -X POST http://localhost:8000/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "your@email.com", "password": "yourpassword"}'
+  -d '{"email": "admin@voidaccess.tech", "password": "yourpassword"}'
 ```
 
 Use the returned token in an `Authorization: Bearer <token>` header for API requests.
@@ -211,6 +213,35 @@ Four Docker services:
 
 The FastAPI backend runs a 13-step pipeline triggered by `POST /investigations`. Every external call has `try/except` with graceful fallback — the pipeline never hard-crashes. API docs are available at **http://localhost:8000/docs** when running.
 
+### Source Tree
+
+```
+voidaccess/
+├── analysis/      # Temporal patterns, OPSEC failure detection, anomaly scoring
+├── api/           # FastAPI routes; investigation pipeline orchestrator
+├── auth/          # JWT authentication and user management
+├── crawler/       # Recursive .onion link discovery spider
+├── db/            # SQLAlchemy ORM models and Alembic migrations
+├── docs/          # Contributing, security, and usage policy documents
+├── export/        # STIX 2.1, MISP, Sigma, and CSV artifact generation
+├── extractor/     # Regex → NER → LLM entity extraction pipeline
+├── fingerprint/   # Stylometry vectors and actor style profiling
+├── graph/         # NetworkX MultiDiGraph builder and pyvis visualization
+├── i18n/          # Language detection, translation, multilingual query expansion
+├── infra/         # Docker Compose, Tor config, Postgres init
+├── monitor/       # APScheduler watches, change diffing, Telegram/SMTP alerts
+├── public/        # Logo, walkthrough screenshots, demo media
+├── scraper/       # Async aiohttp and Playwright scrapers over Tor
+├── scripts/       # Seed imports and operational utilities
+├── search/        # 16+ .onion search engine fan-out with circuit breaker
+├── sources/       # DarkSearch, Telegram, paste sites, threat-intel feeds
+├── tests/         # Pytest suite (one test file per module)
+├── utils/         # Async helpers, content safety, encryption, defang
+├── vector/        # ChromaDB cache with sentence-transformer embeddings
+├── voidaccess/    # LangChain LLM wrappers and provider registry
+└── web/           # Next.js 14 + TypeScript + Tailwind frontend
+```
+
 ---
 
 ## Troubleshooting
@@ -225,7 +256,7 @@ docker compose -f infra/docker-compose.yml --project-directory . logs -f
 - macOS/Linux: `lsof -i :3001` to find what's using it
 - Windows: `netstat -ano | findstr :3001`
 
-**Tor not connecting:** The Tor service takes 30–60 seconds to bootstrap on first start. Check health with `./check_health.sh`.
+**Tor not connecting:** The Tor service takes 30–60 seconds to bootstrap on first start. Check health with `./check_health.sh`. This script verifies Tor proxy connectivity, LLM provider reachability, and dark web search engine availability.
 
 **No .env file:** Run `bash setup.sh` (macOS/Linux/WSL) or `setup.bat` (Windows) before starting.
 
