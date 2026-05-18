@@ -823,13 +823,13 @@ printf "revocation and circuit breaker state.\n"
 printf "  ${DIM}→${NC}  Recommended for production. "
 printf "Skip for local / dev use.\n\n"
 printf "  ${CYAN}▸${NC}  Enable Redis? [y/${BOLD}N${NC}]: "
-read -r redis_ans </dev/tty || redis_ans="n"
+read -r redis_ans || redis_ans="n"
 redis_ans="${redis_ans:-n}"
 
 if [[ "${redis_ans,,}" == "y" ]]; then
     printf "  ${CYAN}▸${NC}  Redis URL "
     printf "[redis://localhost:6379/0]: "
-    read -r redis_url </dev/tty || redis_url=""
+    read -r redis_url || redis_url=""
     redis_url="${redis_url:-redis://localhost:6379/0}"
     grep -q "^REDIS_URL=" .env 2>/dev/null && \
         sed -i "s|^REDIS_URL=.*|REDIS_URL=$redis_url|" \
@@ -864,7 +864,7 @@ print_step "7" "MITRE ATT&CK Cache"
 printf "\n"
 printf "  ${CYAN}▸${NC}  Download MITRE ATT&CK database "
 printf "now? (~33MB) [${BOLD}Y${NC}/n]: "
-read -r mitre_ans </dev/tty || mitre_ans="y"
+read -r mitre_ans || mitre_ans="y"
 mitre_ans="${mitre_ans:-y}"
 
 if [[ "${mitre_ans,,}" != "n" ]]; then
@@ -894,7 +894,7 @@ print_step "8" "Start Stack"
 printf "\n"
 printf "  ${CYAN}▸${NC}  Start VoidAccess now? "
 printf "[${BOLD}Y${NC}/n]: "
-read -r start_ans </dev/tty || start_ans="y"
+read -r start_ans || start_ans="y"
 start_ans="${start_ans:-y}"
 
 if [[ "${start_ans,,}" == "n" ]]; then

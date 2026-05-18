@@ -55,6 +55,7 @@ _common_llm_params = {
     "temperature": 0,
     "streaming": True,
     "callbacks": _common_callbacks,
+    "timeout": 30.0,
 }
 
 RECOMMENDED_MODELS = [

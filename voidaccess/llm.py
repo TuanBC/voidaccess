@@ -262,8 +262,8 @@ def get_llm(model_choice, api_keys: dict | None = None):
     }
     if api_keys:
         for key_name, key_value in api_keys.items():
-            if key_value:
-                param_name = _ENV_TO_LANGCHAIN.get(key_name, key_name)
+            if key_value and key_name in _ENV_TO_LANGCHAIN:
+                param_name = _ENV_TO_LANGCHAIN[key_name]
                 model_specific_params[param_name] = key_value
 
     # Combine common parameters with model-specific parameters

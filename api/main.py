@@ -487,3 +487,23 @@ async def search_test(_=Depends(get_current_user)) -> dict:
         }
     except Exception as exc:
         return {"search_working": False, "error": str(exc)}
+
+
+@app.get("/debug/stack", tags=["health"])
+async def debug_stack() -> dict:
+    """Returns a list of all running asyncio tasks and their stack traces."""
+    import asyncio
+
+    tasks = asyncio.all_tasks()
+    out = []
+    for i, t in enumerate(tasks):
+        stack = []
+        for f in t.get_stack():
+            stack.append(f"{f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}")
+        out.append({
+            "task_id": i,
+            "name": t.get_name(),
+            "coro": str(t.get_coro()),
+            "stack": stack,
+        })
+    return {"tasks": out}

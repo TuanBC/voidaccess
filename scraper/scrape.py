@@ -63,8 +63,8 @@ MAX_RETURN_CHARS = 15_000
 ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_DELAYS = (2.0, 4.0, 8.0)  # seconds before attempt 1, 2, 3
+MAX_RETRIES = 1
+RETRY_DELAYS = (1.0,)  # seconds before attempt 1
 RETRYABLE_STATUS = {500, 502, 503, 504}
 
 # Tor circuit error patterns - indicates circuit failure, not URL failure
@@ -326,7 +326,7 @@ def get_tor_session_cached() -> aiohttp.ClientSession:
         connector = _tor_aiohttp_connector()
         _tor_session = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(connect=10, sock_read=45),
+            timeout=aiohttp.ClientTimeout(connect=3, sock_read=5),
         )
     return _tor_session
 
@@ -472,78 +472,94 @@ async def _fetch_one(
                 await asyncio.sleep(RETRY_DELAYS[attempt - 1])
 
             try:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status in RETRYABLE_STATUS:
-                        last_exc = f"HTTP {resp.status}"
-                        continue  # retry
+                async def _get_with_timeout():
+                    connector = _tor_aiohttp_connector() if is_onion_url(url) else _direct_tcp_connector()
+                    async with aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=aiohttp.ClientTimeout(connect=5, sock_read=25 if not is_onion_url(url) else 5),
+                    ) as local_session:
+                        async with local_session.get(url, headers=headers) as resp:
+                            if resp.status in RETRYABLE_STATUS:
+                                return "retry", f"HTTP {resp.status}", None, None, None
 
-                    if resp.status != 200:
-                        return url, title, None, None, None  # non-retryable (403, 404, …)
+                            if resp.status != 200:
+                                return "fail", None, None, None, None
 
-                    # Content-type guard
-                    content_type = (resp.headers.get("Content-Type") or "").lower()
-                    if content_type and not any(
-                        t in content_type for t in ALLOWED_CONTENT_TYPES
-                    ):
-                        return url, title, None, None, None
+                            content_type = (resp.headers.get("Content-Type") or "").lower()
+                            if content_type and not any(
+                                t in content_type for t in ALLOWED_CONTENT_TYPES
+                            ):
+                                return "fail", None, None, None, None
 
-                    # Stream with 1 MB hard cap
-                    chunks: List[bytes] = []
-                    bytes_read = 0
-                    async for chunk in resp.content.iter_chunked(8192):
-                        if not chunk:
-                            continue
-                        bytes_read += len(chunk)
-                        if bytes_read > MAX_DOWNLOAD_BYTES:
-                            break
-                        chunks.append(chunk)
+                            chunks: List[bytes] = []
+                            bytes_read = 0
+                            async for chunk in resp.content.iter_chunked(8192):
+                                if not chunk:
+                                    continue
+                                bytes_read += len(chunk)
+                                if bytes_read > MAX_DOWNLOAD_BYTES:
+                                    break
+                                chunks.append(chunk)
 
-                    raw_bytes = b"".join(chunks)
-                    encoding = resp.charset or "utf-8"
-                    html = raw_bytes.decode(encoding, errors="replace")
+                            raw_bytes = b"".join(chunks)
+                            encoding = resp.charset or "utf-8"
+                            return "ok", raw_bytes, encoding, None, None
 
-                    db_text = _extract_text(html)
-                    posted_at = extract_post_timestamp(html)
-                    display_text = f"{title} - {db_text}" if db_text else title
+                status_res, r_bytes, enc, _, _ = await asyncio.wait_for(
+                    _get_with_timeout(), timeout=10.0
+                )
 
-                    # --- Playwright fallback for JS-rendered pages ---
-                    if PLAYWRIGHT_ENABLED and db_text and len(db_text) < 300:
-                        # Import lazily to avoid import errors when playwright not installed
-                        try:
-                            from scraper.scrape_js import fetch_with_playwright, is_js_rendered
+                if status_res == "retry":
+                    last_exc = r_bytes
+                    continue
+                elif status_res == "fail":
+                    return url, title, None, None, None
 
-                            if is_js_rendered(html, db_text):
-                                _logger.debug(
-                                    "Playwright fallback triggered for %s...",
+                raw_bytes = r_bytes
+                html = raw_bytes.decode(enc, errors="replace")
+
+                db_text = _extract_text(html)
+                posted_at = extract_post_timestamp(html)
+                display_text = f"{title} - {db_text}" if db_text else title
+
+                # --- Playwright fallback for JS-rendered pages ---
+                if PLAYWRIGHT_ENABLED and db_text and len(db_text) < 300:
+                    # Import lazily to avoid import errors when playwright not installed
+                    try:
+                        from scraper.scrape_js import fetch_with_playwright, is_js_rendered
+
+                        if is_js_rendered(html, db_text):
+                            _logger.debug(
+                                "Playwright fallback triggered for %s...",
+                                url[:40] if len(url) > 40 else url,
+                            )
+                            js_result = await fetch_with_playwright(
+                                url=url,
+                                tor_proxy_host=TOR_PROXY_HOST,
+                                tor_proxy_port=TOR_PROXY_PORT,
+                            )
+                            # Use JS result if it got more content
+                            if js_result.get("content") and len(js_result.get("content", "")) > len(
+                                db_text
+                            ):
+                                html = js_result.get("raw_html", html)
+                                db_text = js_result.get("content", "")
+                                posted_at = js_result.get("posted_at", posted_at)
+                                display_text = f"{title} - {db_text}" if db_text else title
+                                _logger.info(
+                                    "Playwright improved content: %d chars from %s...",
+                                    len(db_text),
                                     url[:40] if len(url) > 40 else url,
                                 )
-                                js_result = await fetch_with_playwright(
-                                    url=url,
-                                    tor_proxy_host=TOR_PROXY_HOST,
-                                    tor_proxy_port=TOR_PROXY_PORT,
-                                )
-                                # Use JS result if it got more content
-                                if js_result.get("content") and len(js_result.get("content", "")) > len(
-                                    db_text
-                                ):
-                                    html = js_result.get("raw_html", html)
-                                    db_text = js_result.get("content", "")
-                                    posted_at = js_result.get("posted_at", posted_at)
-                                    display_text = f"{title} - {db_text}" if db_text else title
-                                    _logger.info(
-                                        "Playwright improved content: %d chars from %s...",
-                                        len(db_text),
-                                        url[:40] if len(url) > 40 else url,
-                                    )
-                        except ImportError:
-                            # Playwright not installed - skip silently
-                            pass
-                        except Exception as e:
-                            # Keep original aiohttp result if Playwright fails
-                            _logger.debug("Playwright fallback failed: %s", e)
-                            pass
+                    except ImportError:
+                        # Playwright not installed - skip silently
+                        pass
+                    except Exception as e:
+                        # Keep original aiohttp result if Playwright fails
+                        _logger.debug("Playwright fallback failed: %s", e)
+                        pass
 
-                    return url, display_text, raw_bytes, db_text, posted_at
+                return url, display_text, raw_bytes, db_text, posted_at
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 error_str = str(exc)
