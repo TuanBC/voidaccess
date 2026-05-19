@@ -14,9 +14,10 @@ import os
 import uuid
 import zipfile
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from api.auth import CurrentUser, get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -29,18 +30,51 @@ class ExportSelectedBody(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Auth helper
+# ---------------------------------------------------------------------------
+
+
+def _check_investigation_owner(investigation_id: str, current_user: CurrentUser) -> None:
+    """Raise 404 if the investigation does not exist, 403 if the user does not own it."""
+    if not os.getenv("DATABASE_URL"):
+        raise HTTPException(status_code=503, detail="Database not configured")
+    try:
+        uid = uuid.UUID(investigation_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid investigation ID format")
+    try:
+        from db.session import get_session
+        from db.queries import get_investigation_by_id_or_run
+        with get_session() as session:
+            inv = get_investigation_by_id_or_run(session, uid)
+            if inv is None:
+                raise HTTPException(status_code=404, detail="Investigation not found")
+            if str(inv.user_id) != str(current_user.user.id):
+                raise HTTPException(status_code=403, detail="Forbidden")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("_check_investigation_owner failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal error")
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 
 @router.get("/{investigation_id}/stix")
-async def export_stix(investigation_id: str) -> Response:
+async def export_stix(
+    investigation_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Response:
     """
     Return STIX 2.1 bundle as JSON download.
 
     Content-Type: application/json
     Content-Disposition: attachment; filename="voidaccess_{id}_stix.json"
     """
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.stix import investigation_to_stix_bundle, bundle_to_json, _load_entities_for_investigation  # noqa: PLC0415
@@ -71,13 +105,17 @@ async def export_stix(investigation_id: str) -> Response:
 
 
 @router.get("/{investigation_id}/misp")
-async def export_misp(investigation_id: str) -> Response:
+async def export_misp(
+    investigation_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Response:
     """
     Return MISP event as JSON download.
 
     Content-Type: application/json
     Content-Disposition: attachment; filename="voidaccess_{id}_misp.json"
     """
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.misp import investigation_to_misp_event, misp_event_to_json  # noqa: PLC0415
@@ -109,13 +147,17 @@ async def export_misp(investigation_id: str) -> Response:
 
 
 @router.get("/{investigation_id}/sigma")
-async def export_sigma(investigation_id: str) -> StreamingResponse:
+async def export_sigma(
+    investigation_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> StreamingResponse:
     """
     Generate Sigma rules and return as a ZIP download.
 
     Content-Type: application/zip
     Content-Disposition: attachment; filename="voidaccess_{id}_sigma.zip"
     """
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.sigma import (  # noqa: PLC0415
@@ -170,8 +212,10 @@ async def export_sigma(investigation_id: str) -> StreamingResponse:
 async def export_stix_selected(
     investigation_id: str,
     body: ExportSelectedBody,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Response:
     """STIX bundle including only the given entity rows (or all if *entity_ids* is empty)."""
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.stix import investigation_to_stix_bundle, bundle_to_json  # noqa: PLC0415
@@ -199,8 +243,10 @@ async def export_stix_selected(
 async def export_misp_selected(
     investigation_id: str,
     body: ExportSelectedBody,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Response:
     """MISP JSON including only the given entities (or all if *entity_ids* is empty)."""
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.misp import investigation_to_misp_event, misp_event_to_json  # noqa: PLC0415
@@ -228,8 +274,10 @@ async def export_misp_selected(
 async def export_sigma_selected(
     investigation_id: str,
     body: ExportSelectedBody,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> StreamingResponse:
     """Sigma ZIP built from a subset of entities (or all if *entity_ids* is empty)."""
+    _check_investigation_owner(investigation_id, current_user)
     _validate_uuid(investigation_id)
     try:
         from export.sigma import (  # noqa: PLC0415

@@ -56,7 +56,7 @@ def _gitlab_scraping_enabled() -> bool:
 
 def _rss_scraping_enabled() -> bool:
     return os.getenv("RSS_FEEDS_ENABLED", "true").lower() == "true"
-from api.auth import get_current_user, require_password_not_reset_pending
+from api.auth import CurrentUser, get_current_user, require_password_not_reset_pending
 import json
 
 logger = logging.getLogger(__name__)
@@ -2135,8 +2135,26 @@ async def get_temporal_analysis(investigation_id: str) -> dict:
 
 
 @router.get("/{investigation_id}")
-async def get_investigation(investigation_id: str) -> dict:
+async def get_investigation(
+    investigation_id: str,
+    current_user: "CurrentUser" = Depends(get_current_user),
+) -> dict:
     """Return full investigation record including entity count. 404 if not found."""
+    if os.getenv("DATABASE_URL"):
+        try:
+            from db.session import get_session
+            from db.queries import get_investigation_by_id_or_run
+            inv_uuid = uuid.UUID(investigation_id)
+            with get_session() as session:
+                inv = get_investigation_by_id_or_run(session, inv_uuid)
+                if inv is None:
+                    raise HTTPException(status_code=404, detail="Investigation not found")
+                if str(inv.user_id) != str(current_user.user.id):
+                    raise HTTPException(status_code=403, detail="Forbidden")
+        except HTTPException:
+            raise
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid investigation ID format")
     return _get_db_investigation(investigation_id)
 
 
@@ -2149,6 +2167,7 @@ async def get_investigation_entities(
     offset: int = Query(default=0, ge=0),
     defang: bool = Query(default=True),
     freshness_exclude: Optional[str] = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Return paginated entities for an investigation, optionally filtered by type and confidence."""
     if not os.getenv("DATABASE_URL"):
@@ -2167,6 +2186,8 @@ async def get_investigation_entities(
             inv = get_investigation_by_id_or_run(session, inv_uuid)
             if inv is None:
                 raise HTTPException(status_code=404, detail="Investigation not found")
+            if str(inv.user_id) != str(current_user.user.id):
+                raise HTTPException(status_code=403, detail="Forbidden")
 
             linked_ids_subq = (
                 session.query(InvestigationEntityLink.entity_id)
@@ -2267,6 +2288,7 @@ async def get_investigation_entities(
 @router.get("/{investigation_id}/entities/export/csv")
 async def export_investigation_entities_csv(
     investigation_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Response:
     """
     Export entities for an investigation as a CSV file download.
@@ -2292,6 +2314,8 @@ async def export_investigation_entities_csv(
             inv = get_investigation_by_id_or_run(session, inv_uuid)
             if inv is None:
                 raise HTTPException(status_code=404, detail="Investigation not found")
+            if str(inv.user_id) != str(current_user.user.id):
+                raise HTTPException(status_code=403, detail="Forbidden")
 
             linked_ids_subq = (
                 session.query(InvestigationEntityLink.entity_id)
