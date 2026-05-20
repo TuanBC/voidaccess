@@ -174,7 +174,7 @@ def validate_config():
     for key in OPTIONAL_KEYS:
         val = _clean_env(key)
         if val is None:
-            logger.warning(f"Optional configuration key '%s' is not set - related features will be disabled", key)
+            logger.debug(f"Optional configuration key '%s' is not set - related features will be disabled", key)
 
 
 validate_config()
