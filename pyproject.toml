@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voidaccess"
-version = "1.4.5"
+version = "1.4.6"
 description = "Dark web OSINT CLI — automated threat intelligence from query to report"
 readme = "README.md"
 license = "MIT"
