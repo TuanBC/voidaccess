@@ -123,6 +123,24 @@ DEPTH_PRESETS = {
     "deep":    {"top_n": 40, "max_workers": 8, "extract_concurrency": 6},
 }
 
+# Pages kept after LLM relevance filter (must match voidaccess.llm.filter_results cap).
+LLM_FILTER_TOP_N = 15
+
+INVESTIGATION_STEPS = [
+    "Refining query",
+    "Searching dark web",
+    "Filtering results",
+    "Scraping pages",
+    "Extracting entities",
+    "Enriching intelligence",
+    "Enriching domains",
+    "Enriching hashes",
+    "Enriching emails",
+    "Building graph",
+    "Generating summary",
+    "Finalizing results",
+]
+
 
 async def _run_investigation(
     query: str,
@@ -142,10 +160,11 @@ async def _run_investigation(
     cfg = cli_config.load_config()
     preset = DEPTH_PRESETS[depth]
     display = InvestigationDisplay(quiet=quiet)
-    display.start(query)
+    display.start(query, steps=INVESTIGATION_STEPS)
 
     # --- DB init ----------------------------------------------------------
     sqlite_adapter.init_db()
+    _patch_llm_extraction_cache(sqlite_adapter)
 
     # --- Tor preflight ----------------------------------------------------
     tor_proxy: Optional[str] = None
@@ -244,19 +263,19 @@ async def _run_investigation(
 
     # --- Step 3 — filter results ------------------------------------------
     display.update_step("Filtering results", "active")
-    top_n = preset["top_n"]
-    filtered_links = search_links[: top_n * 2] if search_links else []
+    filter_top_n = LLM_FILTER_TOP_N
+    filtered_links = search_links[: filter_top_n * 2] if search_links else []
     if llm is not None and search_links:
         try:
             from voidaccess.llm import filter_results
             filtered_links = await asyncio.to_thread(filter_results, llm, refined, search_links) or search_links
-            filtered_links = filtered_links[:top_n]
+            filtered_links = filtered_links[:filter_top_n]
             display.update_step("Filtering results", "ok", f"top {len(filtered_links)}")
         except Exception as exc:
             display.update_step("Filtering results", "fail", str(exc))
-            filtered_links = search_links[:top_n]
+            filtered_links = search_links[:filter_top_n]
     else:
-        filtered_links = (search_links or [])[:top_n]
+        filtered_links = (search_links or [])[:filter_top_n]
         display.update_step("Filtering results", "skip" if no_llm else "ok", f"{len(filtered_links)} kept")
 
     # --- Step 4 — scrape pages -------------------------------------------
@@ -322,69 +341,57 @@ async def _run_investigation(
     except Exception as exc:
         display.update_step("Extracting entities", "fail", str(exc))
 
-    # --- Step 6 — enrich intelligence ------------------------------------
+    # --- Step 6 — enrich intelligence (OTX + IP) ---------------------------
     display.update_step("Enriching intelligence", "active")
     enrichment_pages: list[dict] = []
     try:
         from sources.enrichment import enrich_investigation as _enrich_inv
         otx_key = os.getenv("OTX_API_KEY", "") or ""
-        # Build entity dicts for sources that take them
         entity_dicts = sqlite_adapter.get_entities(investigation_id)
         enrichment_pages = await _enrich_inv(refined, otx_api_key=otx_key, entities=entity_dicts)
-
-        # IP reputation pass — re-uses sources.ip_reputation
-        try:
-            from sources.ip_reputation import enrich_ip_entities
-            await enrich_ip_entities(extraction_results, investigation_id=inv_uuid)
-        except Exception as ip_exc:
-            console.print(f"[grey50]ip_reputation skipped: {ip_exc}[/grey50]")
-
-        # Step 6.2 — Domain reputation
-        try:
-            extraction_results = await enrich_domain_entities(
-                extraction_results, inv_uuid
-            )
-            display.update_step(
-                "Enriching domains",
-                "done",
-                f"{sum(1 for e in extraction_results if e.get('entity_type') == 'DOMAIN')} domains enriched",
-            )
-        except Exception as e:
-            logger.debug(f"Domain enrichment: {e}")
-
-        # Step 6.3 — Hash reputation
-        try:
-            extraction_results = await enrich_hash_entities(
-                extraction_results, inv_uuid
-            )
-            display.update_step(
-                "Enriching hashes",
-                "done",
-                "",
-            )
-        except Exception as e:
-            logger.debug(f"Hash enrichment: {e}")
-
-        # Step 6.4 — Email reputation
-        try:
-            extraction_results = await enrich_email_entities(
-                extraction_results, inv_uuid
-            )
-            display.update_step(
-                "Enriching emails",
-                "done",
-                "",
-            )
-        except Exception as e:
-            logger.debug(f"Email enrichment: {e}")
-
         sources_used["enrichment"] = {"status": "ok", "count": len(enrichment_pages)}
         display.update_step("Enriching intelligence", "ok", f"{len(enrichment_pages)} pages added")
     except Exception as exc:
         sources_used["enrichment"] = {"status": "fail", "error": str(exc)}
         display.update_step("Enriching intelligence", "fail", str(exc))
 
-    # Run extraction over enrichment pages too
+    try:
+        from sources.ip_reputation import enrich_ip_entities
+        await enrich_ip_entities(extraction_results, investigation_id=inv_uuid)
+    except Exception as ip_exc:
+        logger.debug("ip_reputation skipped: %s", ip_exc)
+
+    # --- Step 6.2–6.4 — domain / hash / email (before graph) -------------
+    display.update_step("Enriching domains", "active")
+    try:
+        extraction_results = await enrich_domain_entities(extraction_results, inv_uuid)
+        domain_count = sum(
+            1
+            for e in sqlite_adapter.get_entities(investigation_id)
+            if (e.get("entity_type") or "").upper() == "DOMAIN"
+        )
+        detail = f"{domain_count} domains enriched" if domain_count else ""
+        display.update_step("Enriching domains", "ok", detail)
+    except Exception as exc:
+        logger.debug("Domain enrichment: %s", exc)
+        display.update_step("Enriching domains", "fail", str(exc))
+
+    display.update_step("Enriching hashes", "active")
+    try:
+        extraction_results = await enrich_hash_entities(extraction_results, inv_uuid)
+        display.update_step("Enriching hashes", "ok")
+    except Exception as exc:
+        logger.debug("Hash enrichment: %s", exc)
+        display.update_step("Enriching hashes", "fail", str(exc))
+
+    display.update_step("Enriching emails", "active")
+    try:
+        extraction_results = await enrich_email_entities(extraction_results, inv_uuid)
+        display.update_step("Enriching emails", "ok")
+    except Exception as exc:
+        logger.debug("Email enrichment: %s", exc)
+        display.update_step("Enriching emails", "fail", str(exc))
+
     if enrichment_pages:
         try:
             from extractor.pipeline import extract_entities_from_pages as _extr2
@@ -485,6 +492,15 @@ async def _run_investigation(
     # Close any cached aiohttp sessions so the event loop exits cleanly
     # (otherwise aiohttp prints "Unclosed client session" warnings).
     await _close_cached_sessions()
+
+
+def _patch_llm_extraction_cache(sqlite_adapter: Any) -> None:
+    """Use sqlite adapter for cache reads (naive ISO strings from SQLite)."""
+    try:
+        import extractor.llm_extract as llm_extract
+    except Exception:
+        return
+    llm_extract._load_from_cache = sqlite_adapter.get_page_extraction_cache
 
 
 async def _close_cached_sessions() -> None:

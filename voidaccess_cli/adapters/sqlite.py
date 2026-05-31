@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from sqlalchemy import text
 
@@ -51,6 +51,48 @@ def _serialize_dt(dt: Optional[datetime]) -> Optional[str]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
+
+
+def _coerce_expires_at(expires_at: Union[str, datetime]) -> datetime:
+    """SQLite returns TIMESTAMP columns as strings; normalize for comparisons."""
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at
+
+
+def get_page_extraction_cache(page_hash: str) -> Optional[dict[str, list[str]]]:
+    """Load cached LLM extraction results when present and not expired."""
+    try:
+        from db.session import get_session
+    except Exception:
+        return None
+
+    try:
+        with get_session() as session:
+            row = session.execute(
+                text(
+                    """
+                    SELECT entities_json, expires_at
+                    FROM page_extraction_cache
+                    WHERE page_hash = :page_hash
+                    """
+                ),
+                {"page_hash": page_hash},
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        entities_json, expires_at = row[0], row[1]
+        expires_at = _coerce_expires_at(expires_at)
+        if expires_at < datetime.now(timezone.utc):
+            return None
+
+        return json.loads(entities_json)
+    except Exception:
+        return None
 
 
 def save_investigation(
