@@ -223,6 +223,55 @@ Redis is optional (`REDIS_URL`). When present it stores:
 
 In-process Python dicts (`_infra_cluster_cache`, `_sources_used_cache`, `_cancel_flags`) are used for per-investigation state that does not need to survive restarts.
 
+### 1.5 CLI Interface
+
+VoidAccess also ships as a pip-installable CLI. The CLI uses a local SQLite database and config under `~/.voidaccess/`, and it shares the same search, scraping, extraction, and enrichment modules as the Docker stack.
+
+#### Installation
+
+```bash
+pip install voidaccess
+```
+
+#### Configuration and Data Paths
+
+| Path | Purpose |
+|---|---|
+| `~/.voidaccess/config.json` | Saved CLI config: LLM provider, model, API keys, Tor proxy, and output directory |
+| `~/.voidaccess/investigations.db` | SQLite database used by `voidaccess list`, `show`, `export`, and `enrich` |
+| `~/.voidaccess/results/` | Default output directory for JSON and Markdown reports |
+
+#### Commands and Flags
+
+| Command | Common flags | Notes |
+|---|---|---|
+| `voidaccess investigate "<query>"` | `--output`, `--model`, `--no-tor`, `--no-llm`, `--depth`, `--format`, `--quiet`, `--no-banner` | Runs the full local pipeline and writes report files |
+| `voidaccess show [target]` | `--no-tui` | Opens the entity browser, or prints a summary table for scripted use |
+| `voidaccess export <target>` | `--format`, `--output` | Exports STIX, MISP, Sigma, CSV, MD, or JSON from a saved investigation |
+| `voidaccess enrich <target>` | `--skip-ips`, `--skip-domains`, `--skip-hashes`, `--skip-emails` | Re-runs post-processing enrichment against current feeds |
+| `voidaccess list` | `--limit`, `--json` | Lists saved investigations from the local SQLite DB |
+| `voidaccess status` | top-level `--no-banner` | Shows config, API key status, Tor reachability, and spaCy status |
+| `voidaccess configure` | `llm`, `keys`, `tor` | First-run wizard and targeted configuration subcommands |
+
+#### Tor Detection
+
+The CLI checks for a local Tor SOCKS5 proxy in this order:
+
+1. `127.0.0.1:9050`
+2. `127.0.0.1:9150`
+3. The configured `tor.host` / `tor.port` from `~/.voidaccess/config.json`
+
+Use `--no-tor` for clearnet-only investigations.
+
+#### Differences from Docker
+
+- No built-in Tor; a local Tor install or Tor Browser proxy is required for dark web sources.
+- SQLite is used instead of PostgreSQL.
+- The entity browser is a terminal TUI rather than the sigma.js graph UI.
+- Monitoring and scheduled alerts are not included.
+- Multi-user auth and JWT-backed API routes are not included.
+- spaCy (`en_core_web_sm`) auto-installs on first use if it is missing.
+
 ---
 
 ## 2. Investigation Pipeline
@@ -1049,6 +1098,14 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 ---
 
 ## 13. Known Limitations
+
+### CLI Requires Local Tor
+
+The CLI probes `127.0.0.1:9050`, then `127.0.0.1:9150`, then the configured Tor proxy. If none respond, dark web investigations stop unless `--no-tor` is used for clearnet-only runs.
+
+### spaCy Auto-Installs on First Use
+
+The CLI installs `en_core_web_sm` automatically if it is missing. First run can stall on locked-down machines or on hosts without network access to PyPI.
 
 ### Tor Search Engine Coverage
 

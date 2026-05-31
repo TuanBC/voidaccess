@@ -27,7 +27,13 @@ from typing import Any, Optional
 import typer
 from rich.console import Console
 
+# Import reputation enrichment sources (used in Step 6.2–6.4)
+from sources.domain_reputation import enrich_domain_entities
+from sources.email_reputation import enrich_email_entities
+from sources.hash_reputation import enrich_hash_entities
+
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +339,45 @@ async def _run_investigation(
         except Exception as ip_exc:
             console.print(f"[grey50]ip_reputation skipped: {ip_exc}[/grey50]")
 
+        # Step 6.2 — Domain reputation
+        try:
+            extraction_results = await enrich_domain_entities(
+                extraction_results, inv_uuid
+            )
+            display.update_step(
+                "Enriching domains",
+                "done",
+                f"{sum(1 for e in extraction_results if e.get('entity_type') == 'DOMAIN')} domains enriched",
+            )
+        except Exception as e:
+            logger.debug(f"Domain enrichment: {e}")
+
+        # Step 6.3 — Hash reputation
+        try:
+            extraction_results = await enrich_hash_entities(
+                extraction_results, inv_uuid
+            )
+            display.update_step(
+                "Enriching hashes",
+                "done",
+                "",
+            )
+        except Exception as e:
+            logger.debug(f"Hash enrichment: {e}")
+
+        # Step 6.4 — Email reputation
+        try:
+            extraction_results = await enrich_email_entities(
+                extraction_results, inv_uuid
+            )
+            display.update_step(
+                "Enriching emails",
+                "done",
+                "",
+            )
+        except Exception as e:
+            logger.debug(f"Email enrichment: {e}")
+
         sources_used["enrichment"] = {"status": "ok", "count": len(enrichment_pages)}
         display.update_step("Enriching intelligence", "ok", f"{len(enrichment_pages)} pages added")
     except Exception as exc:
@@ -367,10 +412,10 @@ async def _run_investigation(
     if llm is not None:
         try:
             from voidaccess.llm import generate_summary
-            corpus = "\n\n".join(p["text"][:5000] for p in scraped_pages[:10])
-            if corpus:
+            pages_to_summarize = scraped_pages[:10]
+            if pages_to_summarize:
                 summary_text = await asyncio.to_thread(
-                    generate_summary, llm, refined, corpus, "threat_intel"
+                    generate_summary, llm, refined, pages_to_summarize, "threat_intel"
                 )
             display.update_step("Generating summary", "ok")
         except Exception as exc:

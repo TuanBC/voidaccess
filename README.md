@@ -19,6 +19,58 @@ Commercial threat intelligence platforms often charge prohibitive annual fees fo
 
 ---
 
+## Quick Start
+
+### Option A - CLI (no Docker, 30 seconds)
+
+```bash
+pip install voidaccess
+voidaccess configure
+voidaccess investigate "LockBit ransomware"
+```
+
+Requires local Tor for dark web sources:
+
+- https://torproject.org
+- Use `--no-tor` for clearnet-only investigations
+
+The CLI stores config in `~/.voidaccess/config.json` and writes results to `~/.voidaccess/results/`.
+
+### Option B - Docker (full stack, 5 minutes)
+
+```bash
+git clone https://github.com/KatrielMoses/voidaccess
+cd voidaccess
+bash setup.sh
+```
+
+The Docker stack includes PostgreSQL, Tor, FastAPI, and Next.js.
+
+### CLI Commands
+
+| Command | Description |
+|---|---|
+| `voidaccess investigate` | Run an investigation |
+| `voidaccess show` | Interactive entity browser |
+| `voidaccess export` | Export STIX/MISP/Sigma/CSV/MD |
+| `voidaccess enrich` | Re-enrich saved results |
+| `voidaccess list` | List saved investigations |
+| `voidaccess status` | Config and API key status |
+| `voidaccess configure` | Setup wizard |
+
+### CLI vs Docker
+
+| Feature | CLI | Docker |
+|---|---|---|
+| Install time | 30 seconds | 5 minutes |
+| Dark web scraping | Requires local Tor | Built-in |
+| Graph visualization | Terminal TUI | sigma.js |
+| Monitoring/alerts | No | Yes |
+| Multi-user | No | Yes |
+| Persistence | SQLite (`~/.voidaccess`) | PostgreSQL |
+
+---
+
 ## Visual Walkthrough
 
 ### 1. Intuitive Dashboard
@@ -167,7 +219,7 @@ Free with Groq, OpenRouter free models, or Ollama. Under $0.50 per investigation
 
 ---
 
-## What's New in v1.3
+## Recent Updates
 
 - **10 new enrichment sources**: GreyNoise (scanner suppression), AbuseIPDB, Feodo Tracker, C2IntelFeeds, crt.sh, URLScan.io, Wayback Machine, Hybrid Analysis, HaveIBeenPwned, EmailRep
 - **4 new clearnet collection sources**: paste sites, GitHub code search, GitLab code search, and 20 curated RSS security feeds
@@ -182,7 +234,7 @@ Free with Groq, OpenRouter free models, or Ollama. Under $0.50 per investigation
 
 ---
 
-## Quick Start
+## Docker Setup
 
 ### Prerequisites
 - Docker and Docker Compose

@@ -30,6 +30,18 @@ def init_db() -> None:
     engine = get_engine()
     Base.metadata.create_all(engine)
 
+    # Create page_extraction_cache table if missing
+    with engine.connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS page_extraction_cache (
+                page_hash TEXT PRIMARY KEY,
+                entities_json TEXT NOT NULL,
+                extracted_at TIMESTAMP NOT NULL,
+                expires_at TIMESTAMP NOT NULL
+            )
+        """)
+        conn.commit()
+
 
 def _serialize_dt(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:

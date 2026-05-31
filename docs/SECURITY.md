@@ -4,10 +4,10 @@
 
 | Version | Supported |
 |---------|-----------|
-| v1.0.0   | Yes       |
+| v1.4.3   | Yes       |
 
 
-The current version is v1.0.0. Only the latest release receives security fixes.
+The current version is v1.4.3. Only the latest release receives security fixes.
 
 ## What Counts as a Vulnerability
 

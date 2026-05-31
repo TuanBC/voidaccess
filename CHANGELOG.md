@@ -2,6 +2,44 @@
 
 All notable changes to VoidAccess are documented here.
 
+## [1.4.3] - 2026-05-31
+
+### Fixed
+
+- Empty env vars causing HTTP 401 on keyless APIs
+- spaCy model auto-installs on first investigate run
+- Banner centering and circular shape corrected
+- STIX/MISP export path collision fixed
+- Content safety check added to CLI pipeline
+- show --no-tui flag added for scripted use
+
+## [1.4.2] - 2026-05-21
+
+### Fixed
+
+- PyPI version metadata corrected
+- Banner callback condition fixed for Windows
+
+## [1.4.1] - 2026-05-21
+
+### Fixed
+
+- Package namespace collision with other CLI tools (cli/ renamed to voidaccess_cli/)
+- PyPI license metadata format updated
+
+## [1.4.0] - 2026-05-20
+
+### Added
+
+- CLI interface - pip install voidaccess
+- voidaccess investigate, show, export, enrich, list, status, configure commands
+- SQLite persistence at ~/.voidaccess/
+- Textual TUI entity browser
+- Lavender circle ASCII banner
+- Tor auto-detection (9050/9150)
+- All export formats (STIX/MISP/Sigma/CSV/MD)
+- Re-enrichment of saved investigations
+
 ## [1.3.0] - 2025-05-18
 
 ### Added
