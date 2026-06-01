@@ -29,6 +29,10 @@ voidaccess configure
 voidaccess investigate "LockBit ransomware"
 ```
 
+<div align="center">
+  <img src="./public/cli_investigation_gif.gif" alt="VoidAccess CLI investigation walkthrough" width="900">
+</div>
+
 Requires local Tor for dark web sources:
 
 - https://torproject.org
