@@ -310,7 +310,7 @@ async def _run_investigation(
     for extra in (paste_pages, github_pages, gitlab_pages, rss_pages):
         for page in extra:
             url = page.get("url") or page.get("link")
-            text = page.get("text") or page.get("content") or page.get("cleaned_text") or ""
+            text = page.get("text") or page.get("content") or page.get("cleaned_text") or page.get("text_content") or ""
             if not url or not text:
                 continue
             scraped_pages.append({"url": url, "text": text, "source": page.get("source", "clearnet")})
