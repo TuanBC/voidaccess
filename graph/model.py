@@ -30,7 +30,41 @@ class NODE_TYPES:
     IP_ADDRESS = "IPAddress"
     PHONE_NUMBER = "PhoneNumber"
     ORGANIZATION = "Organization"
+    DOMAIN = "Domain"
     DATE = "Date"
+    # Credential / token nodes — high-severity IOC.  All extracted
+    # credential types (AWS / GitHub / Slack / Discord / JWT / Google /
+    # Stripe / generic API key / stealer-log URL) map to this single
+    # node type so the graph stays compact and queryable.
+    CREDENTIAL = "Credential"
+    # Messaging / identity handle nodes — communication IOCs.  All extracted
+    # messaging types (Telegram / Discord / XMPP / Tox / Session / Matrix /
+    # Wire / ICQ / Wickr) collapse to this single node type.  The original
+    # subtype is preserved in node metadata (`messaging_kind`) so downstream
+    # queries can still distinguish a Telegram handle from a Tox ID even
+    # though they share a node type.  Visualized as purple in the graph
+    # (see graph/visualize.py).
+    MESSAGING_HANDLE = "MessagingHandle"
+    # Network indicator nodes — IPv6 + MAC addresses.  These are
+    # second-tier network IOCs (IP_ADDRESS is the more common v4 form
+    # and reuses its own node type).  The original subtype is preserved
+    # in node metadata (`network_kind`) so a query can filter by IPv6
+    # vs MAC even though they share a node type.
+    NETWORK_INDICATOR = "NetworkIndicator"
+    # Malware indicator nodes — YARA rule names + Nuclei template IDs.
+    # Both are detection artifacts used by security tooling; a YARA
+    # rule name + the same vendor's Nuclei template should appear in
+    # the same investigation cluster.  The original subtype is
+    # preserved in node metadata (`malware_kind`).
+    MALWARE_INDICATOR = "MalwareIndicator"
+    # Content indicator nodes — content-addressed identifiers (IPFS
+    # CIDs), credential combo-list block markers, and BIP39 seed
+    # phrase detection markers.  The original subtype is preserved
+    # in node metadata (`content_kind`).  All three signal "this
+    # page contains a content artifact of value" but are
+    # categorically different from credentials (which is a different
+    # node type with its own collapse rules).
+    CONTENT_INDICATOR = "ContentIndicator"
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,51 @@ router = APIRouter(tags=["admin"])
 _seed_validation_jobs: dict[str, dict] = {}
 
 
+@router.get("/enrichment-cache/stats", dependencies=[Depends(get_current_user)])
+async def get_enrichment_cache_stats() -> dict:
+    """
+    Return cross-investigation enrichment cache stats.
+
+    Returns backend, hits, misses, hit_rate_pct, size, and the per-source
+    TTL defaults. Useful for verifying cache wiring and quota savings.
+    """
+    try:
+        from utils.enrichment_cache import get_enrichment_cache
+        cache = await get_enrichment_cache()
+        return await cache.stats()
+    except Exception as exc:
+        logger.warning("get_enrichment_cache_stats failed: %s", exc)
+        return {
+            "backend": "unavailable",
+            "hits": 0,
+            "misses": 0,
+            "hit_rate_pct": 0.0,
+            "size": 0,
+            "error": str(exc)[:200],
+        }
+
+
+@router.post("/enrichment-cache/invalidate", dependencies=[Depends(get_current_user)])
+async def invalidate_enrichment_cache_entry(
+    entity_type: str,
+    value: str,
+    source: str,
+) -> dict:
+    """
+    Force-expire a single enrichment cache entry.
+    Useful when an operator knows an upstream source has stale data.
+    """
+    from utils.enrichment_cache import get_enrichment_cache
+    cache = await get_enrichment_cache()
+    await cache.invalidate(entity_type, value, source)
+    return {
+        "invalidated": True,
+        "entity_type": entity_type,
+        "value": value,
+        "source": source,
+    }
+
+
 @router.get("/circuit-breakers")
 async def get_circuit_breakers(current_user=Depends(get_current_user)) -> dict:
     """
@@ -212,3 +257,81 @@ async def add_seed(body: AddSeedBody) -> dict:
             detail="Seed not added (duplicate URL or blocked by content safety)",
         )
     return {"added": True, "url": body.url, "category": body.category}
+
+
+@router.get("/seeds/discovered", dependencies=[Depends(get_current_user)])
+async def list_discovered_seeds(
+    only_pending: bool = True,
+    limit: int = 100,
+    investigation_id: Optional[str] = None,
+) -> dict:
+    """
+    List auto-discovered seeds, with provenance metadata.
+
+    Args:
+        only_pending: when True (default), restrict to seeds still
+            awaiting validate_seeds() confirmation (status == "discovered").
+            Set to False to include already-validated discovered seeds too.
+        limit: maximum number of results (default 100, hard cap 1000).
+        investigation_id: optional filter — return only seeds discovered
+            by a specific investigation.
+
+    Returns:
+        {
+            "total": int,
+            "breakdown": { "permanent": N, "discovered_pending": N, ... },
+            "last_validated": ISO timestamp | None,
+            "seeds": [ { url, name, source_url, investigation_id, added_at, status } ]
+        }
+    """
+    try:
+        seed_manager = get_seed_manager()
+        limit = max(1, min(int(limit), 1000))
+
+        seeds = seed_manager.list_discovered_seeds(
+            only_pending=only_pending,
+            limit=None,
+        )
+
+        # Optional investigation_id filter — applied after the list call
+        # since it's an in-memory filter, not an index lookup.
+        if investigation_id:
+            seeds = [s for s in seeds if s.get("investigation_id") == investigation_id]
+
+        seeds = seeds[:limit]
+
+        # Project each seed down to the fields the admin UI cares about.
+        projected = [
+            {
+                "url": s.get("url", ""),
+                "name": s.get("name", ""),
+                "status": s.get("status", ""),
+                "added": s.get("added", ""),
+                "added_at": s.get("added_at", ""),
+                "source_url": s.get("source_url", ""),
+                "investigation_id": s.get("investigation_id", ""),
+                "tags": s.get("tags", []),
+            }
+            for s in seeds
+        ]
+
+        return {
+            "total": len(projected),
+            "breakdown": seed_manager.count_by_type(),
+            "last_validated": seed_manager.summary().get("last_validated"),
+            "seeds": projected,
+        }
+    except Exception as exc:
+        logger.warning("list_discovered_seeds failed: %s", exc)
+        return {
+            "total": 0,
+            "breakdown": {
+                "permanent": 0,
+                "discovered_total": 0,
+                "discovered_pending": 0,
+                "discovered_validated": 0,
+            },
+            "last_validated": None,
+            "seeds": [],
+            "error": str(exc)[:200],
+        }

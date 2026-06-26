@@ -48,7 +48,26 @@ from sqlalchemy.orm import sessionmaker, Session
 
 import config
 
+DATABASE_URL = config.DATABASE_URL
 _async_engine_cache: dict[str, "AsyncEngine"] = {}
+
+
+class _EngineCacheCompat:
+    def pop(self, url: str, default=None):
+        try:
+            engine = get_engine(url)
+            engine.dispose()
+        except Exception:
+            return default
+        finally:
+            _get_engine_cached.cache_clear()
+        return engine
+
+    def clear(self) -> None:
+        _get_engine_cached.cache_clear()
+
+
+_engine_cache = _EngineCacheCompat()
 
 
 @lru_cache(maxsize=8)
@@ -85,7 +104,7 @@ def get_engine(url: Optional[str] = None) -> Engine:
     PostgreSQL gets a connection pool tuned for the scraping workload.
     SQLite skips pool parameters that only apply to QueuePool.
     """
-    target_url = url or config.DATABASE_URL
+    target_url = url or DATABASE_URL
     if not target_url:
         raise RuntimeError(
             "DATABASE_URL is not configured.\n"
@@ -103,7 +122,7 @@ def release_engine(url: Optional[str] = None) -> None:
     Calls engine.dispose() to release connection pool resources and file handles,
     then clears the cache. Use this in test teardown to prevent leaks.
     """
-    target_url = url or config.DATABASE_URL
+    target_url = url or DATABASE_URL
     if target_url:
         try:
             engine = get_engine(target_url)
@@ -121,7 +140,7 @@ def get_async_engine(url: Optional[str] = None) -> "AsyncEngine":
     """
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    target_url = url or config.DATABASE_URL
+    target_url = url or DATABASE_URL
     if not target_url:
         raise RuntimeError(
             "DATABASE_URL is not configured.\n"
@@ -167,7 +186,7 @@ def release_async_engine(url: Optional[str] = None) -> None:
 
     Calls engine.dispose() to release connection pool resources and file handles.
     """
-    target_url = url or config.DATABASE_URL
+    target_url = url or DATABASE_URL
     if target_url in _async_engine_cache:
         _async_engine_cache[target_url].dispose()
         del _async_engine_cache[target_url]

@@ -14,7 +14,8 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Callable
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
 
 from fastapi import FastAPI, Depends, Request
 from fastapi.exceptions import RequestValidationError
@@ -24,7 +25,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from api.routes import entities, export, investigations, monitors, search, auth, admin, settings
+from api.routes import entities, export, investigations, monitors, search, auth, admin, settings, actors
 from api.auth import get_current_user
 from monitor.scheduler import start_scheduler
 
@@ -118,18 +119,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Seed database load failed (non-fatal): {e}")
 
-    # Recover stranded processing investigations
+    # Recover stranded processing investigations (Phase 6.3 startup sweep)
+    # On startup: every investigation left in 'processing' by a previous
+    # process is marked failed — the pipeline tasks that owned them are
+    # gone.  A periodic sweep (every 5 min) handles investigations that
+    # get stuck while the server is alive.
     try:
         if os.getenv("DATABASE_URL"):
-            from db.session import get_session
-            from db.models import Investigation
-            with get_session() as session:
-                stranded_count = session.query(Investigation).filter(Investigation.status == "processing").update(
-                    {"status": "failed", "summary": "Investigation interrupted due to server restart."}
+            swept = await _sweep_stuck_investigations(cutoff_minutes=None)
+            if swept:
+                logger.warning(
+                    "Recovered %d stranded investigations (marked as failed).",
+                    swept,
                 )
-                if stranded_count > 0:
-                    session.commit()
-                    logger.warning(f"Recovered {stranded_count} stranded investigations (marked as failed).")
     except Exception as e:
         logger.warning(f"Failed to recover stranded investigations: {e}")
 
@@ -145,9 +147,31 @@ async def lifespan(app: FastAPI):
         logger.error(f"APScheduler failed to start: {e}")
         scheduler = None
 
+    # Start periodic stuck-investigation sweeper (Phase 6.3). Runs every
+    # 5 minutes and marks investigations stuck in 'processing' for more
+    # than INVESTIGATION_HARD_TIMEOUT_MINUTES as 'failed'.  Cancelled on
+    # shutdown below.
+    _periodic_sweep_task: Optional[asyncio.Task] = None
+    if os.getenv("DATABASE_URL"):
+        try:
+            _periodic_sweep_task = asyncio.create_task(
+                _periodic_stuck_sweep(),
+                name="voidaccess-stuck-investigation-sweeper",
+            )
+            logger.info("Periodic stuck-investigation sweeper started (every 5 min).")
+        except Exception as e:
+            logger.warning(f"Failed to start periodic sweeper: {e}")
+
     yield
 
     # --- Shutdown ---
+    if _periodic_sweep_task is not None and not _periodic_sweep_task.done():
+        _periodic_sweep_task.cancel()
+        try:
+            await _periodic_sweep_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
         logger.warning("APScheduler stopped")
@@ -168,6 +192,120 @@ async def lifespan(app: FastAPI):
         await close_cached_sessions()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Stuck-investigation sweeper (Phase 6.3)
+# ---------------------------------------------------------------------------
+# FastAPI BackgroundTasks runs in the same process as the HTTP handler.
+# If the worker crashes mid-investigation, the row stays at status='processing'
+# forever.  This sweeper marks them 'failed' on two schedules:
+#
+#   1. Startup  — cutoff_minutes=None → every 'processing' row is swept
+#                 (the prior process is gone, no legitimate owner).
+#   2. Periodic — every 5 minutes, cutoff = INVESTIGATION_HARD_TIMEOUT_MINUTES
+#                 (configurable via env).  Defends against in-process hangs.
+#
+# The sweep only ever UPDATES status; it never deletes rows.
+
+# Hard timeout after which an investigation is considered permanently stuck.
+# Default 30 min — generous enough to cover the slowest legitimate run
+# (parallel_sources 300s + enrichment 120s + graph 60s + summary 90s + finalize
+# 30s ≈ 10 min on a healthy host; 30 min is 3x that to absorb transient
+# network slowness without false positives).
+INVESTIGATION_HARD_TIMEOUT_MINUTES = int(
+    os.getenv("VOIDACCESS_INVESTIGATION_HARD_TIMEOUT_MINUTES", "30") or 30
+)
+# Periodic sweep interval. 5 min is a good default — catches stuck rows
+# quickly without flooding the DB.
+SWEEP_INTERVAL_SECONDS = int(
+    os.getenv("VOIDACCESS_SWEEP_INTERVAL_SECONDS", "300") or 300
+)
+
+
+async def _sweep_stuck_investigations(cutoff_minutes: Optional[int] = 30) -> int:
+    """Mark investigations stuck in 'processing' as 'failed'.
+
+    Args:
+        cutoff_minutes: Only sweep rows older than this many minutes.
+            ``None`` → startup mode: sweep *all* processing rows (the prior
+            process is gone, no legitimate owner remains).
+            ``int``  → periodic mode: sweep only rows older than the cutoff.
+
+    Returns the number of rows swept.  Returns 0 when DB is unconfigured,
+    the table is missing, or no rows match — never raises.
+    """
+    if not os.getenv("DATABASE_URL"):
+        return 0
+    try:
+        from db.session import get_session
+        from db.models import Investigation
+
+        # Build the query in a short-lived session, do the UPDATE in another.
+        with get_session() as session:
+            query = session.query(Investigation).filter(
+                Investigation.status == "processing"
+            )
+            if cutoff_minutes is not None:
+                cutoff_dt = datetime.now(timezone.utc) - timedelta(
+                    minutes=cutoff_minutes
+                )
+                query = query.filter(Investigation.created_at < cutoff_dt)
+
+            stuck = query.all()
+            if not stuck:
+                return 0
+
+            swept_ids = [inv.id for inv in stuck]
+            sweep_reason = (
+                "Server restarted mid-investigation"
+                if cutoff_minutes is None
+                else f"Investigation timed out after {cutoff_minutes} min — "
+                     "server may have restarted or pipeline may be hung"
+            )
+
+        # Update outside the read session.
+        from sqlalchemy import update
+        with get_session() as session:
+            session.execute(
+                update(Investigation)
+                .where(Investigation.id.in_(swept_ids))
+                .values(
+                    status="failed",
+                    summary=sweep_reason,
+                )
+            )
+            session.commit()
+
+        for inv_id in swept_ids:
+            logger.warning("Swept stuck investigation: %s", inv_id)
+        logger.info("Swept %d stuck investigations (cutoff=%s)", len(swept_ids), cutoff_minutes)
+        return len(swept_ids)
+    except Exception as exc:
+        logger.warning("Swept-investigation sweep failed: %s", exc)
+        return 0
+
+
+async def _periodic_stuck_sweep() -> None:
+    """Background task: every SWEEP_INTERVAL_SECONDS, sweep stuck rows.
+
+    Runs until cancelled by the lifespan teardown.  Sleeps in a loop so
+    cancelling the task is the only stop signal — never raises.
+    """
+    try:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            try:
+                await _sweep_stuck_investigations(
+                    cutoff_minutes=INVESTIGATION_HARD_TIMEOUT_MINUTES,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Periodic stuck-investigation sweep iteration failed: %s", exc)
+    except asyncio.CancelledError:
+        logger.info("Periodic stuck-investigation sweep cancelled.")
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +430,12 @@ app.include_router(
     monitors.router,
     prefix="/monitors",
     tags=["monitors"],
+    dependencies=[Depends(get_current_user)],
+)
+app.include_router(
+    actors.router,
+    prefix="/actors",
+    tags=["actors"],
     dependencies=[Depends(get_current_user)],
 )
 app.include_router(

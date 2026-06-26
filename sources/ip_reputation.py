@@ -27,9 +27,11 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
+
+from utils.enrichment_cache import DEFAULT_TTL, get_enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,18 @@ _feed_cache: dict[str, dict] = {
     "feodo":   {"ips": {}, "loaded_at": 0.0},
     "c2feeds": {"ips": {}, "loaded_at": 0.0},
 }
+
+# Module-level enrichment cache singleton (lazy-init on first lookup).
+# Feodo and C2IntelFeeds use the in-memory feed cache above — skip those.
+_enrichment_cache_singleton: Optional[Any] = None
+
+
+async def _get_enrichment_cache():
+    """Lazy-init accessor for the cross-investigation enrichment cache."""
+    global _enrichment_cache_singleton
+    if _enrichment_cache_singleton is None:
+        _enrichment_cache_singleton = await get_enrichment_cache()
+    return _enrichment_cache_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +220,26 @@ async def _check_abuseipdb(ip: str, api_key: str) -> dict:
         return {}
 
 
+async def _cached_check_abuseipdb(ip: str, api_key: str) -> dict:
+    """Cached wrapper around _check_abuseipdb (24h TTL).
+
+    Wraps the live AbuseIPDB call in the cross-investigation enrichment cache.
+    Successful responses (containing a ``data`` key) are stored; transient
+    errors (empty ``{}``) fall through uncached so retries aren't blocked.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("IP_ADDRESS", ip, "abuseipdb")
+    if cached is not None:
+        logger.debug("AbuseIPDB cache hit: %s", ip)
+        return cached
+    result = await _check_abuseipdb(ip, api_key)
+    if result and isinstance(result, dict) and result.get("data"):
+        await cache.set(
+            "IP_ADDRESS", ip, "abuseipdb", result, DEFAULT_TTL["abuseipdb"]
+        )
+    return result
+
+
 async def _check_greynoise(ip: str, api_key: str) -> dict:
     """Query GreyNoise community API. Returns parsed response or {}."""
     try:
@@ -225,6 +259,26 @@ async def _check_greynoise(ip: str, api_key: str) -> dict:
     except Exception as exc:
         logger.debug("ip_reputation: GreyNoise check failed for %s: %s", ip, exc)
         return {}
+
+
+async def _cached_check_greynoise(ip: str, api_key: str) -> dict:
+    """Cached wrapper around _check_greynoise (6h TTL).
+
+    Caches both real responses and 404 ``{"classification": "unknown"}`` results
+    so we don't hammer GreyNoise repeatedly for known-unknown IPs. Empty error
+    responses (``{}``) are NOT cached.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("IP_ADDRESS", ip, "greynoise")
+    if cached is not None:
+        logger.debug("GreyNoise cache hit: %s", ip)
+        return cached
+    result = await _check_greynoise(ip, api_key)
+    if result:
+        await cache.set(
+            "IP_ADDRESS", ip, "greynoise", result, DEFAULT_TTL["greynoise"]
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +345,7 @@ async def check_ip_reputation(
 
     # --- AbuseIPDB check ---
     if abuseipdb_key:
-        abuse_resp = await _check_abuseipdb(ip, abuseipdb_key)
+        abuse_resp = await _cached_check_abuseipdb(ip, abuseipdb_key)
         if abuse_resp:
             data = abuse_resp.get("data", {})
             score = data.get("abuseConfidenceScore")
@@ -306,7 +360,7 @@ async def check_ip_reputation(
 
     # --- GreyNoise check ---
     if greynoise_key:
-        gn_resp = await _check_greynoise(ip, greynoise_key)
+        gn_resp = await _cached_check_greynoise(ip, greynoise_key)
         if gn_resp:
             classification = gn_resp.get("classification", "unknown")
             result["greynoise_classification"] = classification

@@ -73,7 +73,7 @@ def get_actor_collection():
     Singleton Chroma collection for actor style profiles.
     Uses cosine similarity (L2 normalized).
     """
-    global _ACTOR_COLLECTION
+    global _ACTOR_COLLECTION, _CLIENT
     if _ACTOR_COLLECTION is not None:
         return _ACTOR_COLLECTION
     try:

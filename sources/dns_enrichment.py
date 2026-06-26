@@ -13,7 +13,9 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+
+from utils.enrichment_cache import DEFAULT_TTL, get_enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,17 @@ MAX_DOMAINS_TO_ENRICH = 20
 MAX_RELATED_PER_ENTITY = 5
 
 CIRCL_DELAY = 0.5
+
+
+# Module-level enrichment cache singleton (lazy-init on first lookup).
+_enrichment_cache_singleton: Optional[Any] = None
+
+
+async def _get_enrichment_cache():
+    global _enrichment_cache_singleton
+    if _enrichment_cache_singleton is None:
+        _enrichment_cache_singleton = await get_enrichment_cache()
+    return _enrichment_cache_singleton
 
 
 class DNSEnrichment:
@@ -293,6 +306,14 @@ class DNSEnrichment:
         if not self._session:
             return []
         try:
+            cache = await _get_enrichment_cache()
+            cached = await cache.get("IP_ADDRESS", ip, "circl_pdns")
+            if cached is not None:
+                logger.debug("CIRCL PDNS IP cache hit: %s", ip)
+                return cached
+        except Exception:
+            pass
+        try:
             async with self._session.get(
                 f"{CIRCL_PDNS_URL}/{ip}",
                 timeout=aiohttp.ClientTimeout(total=CIRCL_TIMEOUT),
@@ -307,7 +328,16 @@ class DNSEnrichment:
                             records.append(json.loads(line))
                         except Exception:
                             pass
-                return records[:20]
+                records = records[:20]
+                try:
+                    cache = await _get_enrichment_cache()
+                    await cache.set(
+                        "IP_ADDRESS", ip, "circl_pdns",
+                        records, DEFAULT_TTL["circl_pdns"],
+                    )
+                except Exception:
+                    pass
+                return records
         except Exception as e:
             logger.debug("CIRCL PDNS IP error %s: %s", ip, e)
             return []
@@ -315,6 +345,14 @@ class DNSEnrichment:
     async def _circl_pdns_domain(self, domain: str) -> list:
         if not self._session:
             return []
+        try:
+            cache = await _get_enrichment_cache()
+            cached = await cache.get("DOMAIN", domain, "circl_pdns")
+            if cached is not None:
+                logger.debug("CIRCL PDNS domain cache hit: %s", domain)
+                return cached
+        except Exception:
+            pass
         try:
             async with self._session.get(
                 f"{CIRCL_PDNS_URL}/{domain}",
@@ -330,7 +368,16 @@ class DNSEnrichment:
                             records.append(json.loads(line))
                         except Exception:
                             pass
-                return records[:20]
+                records = records[:20]
+                try:
+                    cache = await _get_enrichment_cache()
+                    await cache.set(
+                        "DOMAIN", domain, "circl_pdns",
+                        records, DEFAULT_TTL["circl_pdns"],
+                    )
+                except Exception:
+                    pass
+                return records
         except Exception as e:
             logger.debug("CIRCL PDNS domain error %s: %s", domain, e)
             return []
@@ -338,6 +385,14 @@ class DNSEnrichment:
     async def _circl_pssl_ip(self, ip: str) -> list:
         if not self._session:
             return []
+        try:
+            cache = await _get_enrichment_cache()
+            cached = await cache.get("IP_ADDRESS", ip, "circl_pssl")
+            if cached is not None:
+                logger.debug("CIRCL PSSL cache hit: %s", ip)
+                return cached
+        except Exception:
+            pass
         try:
             async with self._session.get(
                 f"{CIRCL_PSSL_URL}/{ip}",
@@ -353,6 +408,14 @@ class DNSEnrichment:
                     if isinstance(cn, list):
                         cn = cn[0] if cn else ""
                     certs.append({"sha1": sha1, "cn": cn, "subject": subjects})
+                try:
+                    cache = await _get_enrichment_cache()
+                    await cache.set(
+                        "IP_ADDRESS", ip, "circl_pssl",
+                        certs, DEFAULT_TTL["circl_pssl"],
+                    )
+                except Exception:
+                    pass
                 return certs
         except Exception as e:
             logger.debug("CIRCL PSSL error %s: %s", ip, e)
@@ -361,6 +424,14 @@ class DNSEnrichment:
     async def _rdap_ip(self, ip: str) -> dict:
         if not self._session:
             return {}
+        try:
+            cache = await _get_enrichment_cache()
+            cached = await cache.get("IP_ADDRESS", ip, "rdap_whois")
+            if cached is not None:
+                logger.debug("RDAP IP cache hit: %s", ip)
+                return cached
+        except Exception:
+            pass
         try:
             async with self._session.get(
                 RDAP_IP_URL.format(ip=ip),
@@ -395,6 +466,14 @@ class DNSEnrichment:
                 result["network"] = handle
             result["raw_handle"] = handle
 
+            try:
+                cache = await _get_enrichment_cache()
+                await cache.set(
+                    "IP_ADDRESS", ip, "rdap_whois",
+                    result, DEFAULT_TTL["rdap_whois"],
+                )
+            except Exception:
+                pass
             return result
         except Exception as e:
             logger.debug("RDAP IP error %s: %s", ip, e)
@@ -403,6 +482,14 @@ class DNSEnrichment:
     async def _rdap_domain(self, domain: str) -> dict:
         if not self._session:
             return {}
+        try:
+            cache = await _get_enrichment_cache()
+            cached = await cache.get("DOMAIN", domain, "rdap_whois")
+            if cached is not None:
+                logger.debug("RDAP domain cache hit: %s", domain)
+                return cached
+        except Exception:
+            pass
         try:
             async with self._session.get(
                 RDAP_DOMAIN_URL.format(domain=domain),
@@ -445,6 +532,14 @@ class DNSEnrichment:
                         break
 
             result["status"] = data.get("status", [])
+            try:
+                cache = await _get_enrichment_cache()
+                await cache.set(
+                    "DOMAIN", domain, "rdap_whois",
+                    result, DEFAULT_TTL["rdap_whois"],
+                )
+            except Exception:
+                pass
             return result
         except Exception as e:
             logger.debug("RDAP domain error %s: %s", domain, e)

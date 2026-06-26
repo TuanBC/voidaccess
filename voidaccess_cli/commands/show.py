@@ -5,6 +5,11 @@ Argument can be:
     a path to a saved .json investigation file
     an investigation id (UUID stored in SQLite)
     omitted → interactive picker over recent runs
+
+Flags
+-----
+--no-tui                  print summary instead of launching the TUI
+--path <from> <to>        print shortest path between two entities, no TUI
 """
 
 from __future__ import annotations
@@ -25,6 +30,11 @@ def run(
         None, help="Investigation id or path to a .json export"
     ),
     no_tui: bool = typer.Option(False, "--no-tui", help="Print summary table without launching TUI (for scripted use)."),
+    path: Optional[list[str]] = typer.Option(
+        None,
+        "--path",
+        help="Find shortest path between two entities. Pass two values after --path: --path <from> <to>.",
+    ),
 ) -> None:
     """Open the entity browser TUI."""
     from voidaccess_cli import config as cli_config
@@ -53,6 +63,17 @@ def run(
             console.print(f"[red]Unknown investigation:[/red] {target}")
             raise typer.Exit(code=1)
 
+    # --path takes precedence: print path to terminal, no TUI.
+    if path:
+        if len(path) != 2:
+            console.print(
+                "[red]--path requires exactly two values:[/red] "
+                "--path <from> <to>"
+            )
+            raise typer.Exit(code=2)
+        _print_path(data, path[0], path[1])
+        return
+
     if no_tui:
         _print_summary(data)
         return
@@ -60,6 +81,83 @@ def run(
     from voidaccess_cli.browser import EntityBrowserApp
     app = EntityBrowserApp(data=data)
     app.run()
+
+
+def _print_path(data: dict, from_value: str, to_value: str) -> None:
+    """Print shortest path between two entities to the terminal (no TUI)."""
+    try:
+        import networkx as nx
+        from graph.builder import find_shortest_path
+    except Exception as exc:
+        console.print(f"[red]Path query unavailable:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    entities = data.get("entities", []) or []
+    relationships = data.get("relationships", []) or []
+
+    ents_by_id = {str(e["id"]): e for e in entities}
+    value_to_id: dict[str, str] = {}
+    for e in entities:
+        cv = (e.get("canonical_value") or "").lower()
+        v = (e.get("value") or "").lower()
+        if cv:
+            value_to_id[cv] = str(e["id"])
+        if v and v not in value_to_id:
+            value_to_id[v] = str(e["id"])
+
+    G = nx.MultiDiGraph()
+    for e in entities:
+        G.add_node(
+            str(e["id"]),
+            entity_type=e.get("entity_type", ""),
+            canonical_value=e.get("canonical_value") or e.get("value") or "",
+        )
+    for r in relationships:
+        src = str(r.get("entity_a_id", ""))
+        tgt = str(r.get("entity_b_id", ""))
+        if not src or not tgt:
+            continue
+        if not G.has_node(src) or not G.has_node(tgt):
+            continue
+        G.add_edge(
+            src,
+            tgt,
+            edge_type=r.get("relationship_type", ""),
+            confidence=float(r.get("confidence") or 0.0),
+        )
+
+    def _resolve(value: str) -> Optional[str]:
+        if value in G:
+            return value
+        return value_to_id.get(value.lower())
+
+    a_id = _resolve(from_value)
+    b_id = _resolve(to_value)
+    if a_id is None:
+        console.print(f"[red]Source entity not found:[/red] {from_value}")
+        raise typer.Exit(code=1)
+    if b_id is None:
+        console.print(f"[red]Target entity not found:[/red] {to_value}")
+        raise typer.Exit(code=1)
+    if a_id == b_id:
+        console.print("[yellow]Source and target are the same entity.[/yellow]")
+        return
+
+    node_path = find_shortest_path(G, a_id, b_id, max_hops=6)
+    if node_path is None:
+        console.print(f"[yellow]No path found within 6 hops.[/yellow]")
+        return
+
+    values = [
+        ents_by_id[n].get("canonical_value")
+        or ents_by_id[n].get("value")
+        or n
+        for n in node_path
+    ]
+    chain = " → ".join(values)
+    hops = len(node_path) - 1
+    console.print(f"[b]Path:[/b] {chain}")
+    console.print(f"[b]Hops:[/b] {hops}")
 
 
 def _print_summary(data: dict) -> None:

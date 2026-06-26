@@ -31,21 +31,24 @@ from textual.widgets import (
 )
 
 
+# NOTE: keys are UPPERCASE to match the normalized entity_type returned by
+# voidaccess_cli.adapters.sqlite._entity_row. If you add a new type here,
+# use the canonical UPPERCASE name (e.g., "BITCOIN_ADDRESS", not "bitcoin_address").
 TYPE_SHORT = {
-    "ip_address":       ("I", "cyan"),
-    "domain":           ("D", "green"),
-    "onion_url":        ("O", "magenta"),
-    "email":            ("E", "yellow"),
-    "file_hash_md5":    ("H", "blue"),
-    "file_hash_sha1":   ("H", "blue"),
-    "file_hash_sha256": ("H", "blue"),
-    "crypto_wallet":    ("W", "yellow"),
-    "ransomware_group": ("R", "red"),
-    "malware":          ("M", "red"),
-    "cve":              ("C", "red"),
-    "phone":            ("P", "grey50"),
-    "handle":           ("@", "yellow"),
-    "pgp_key":          ("K", "grey50"),
+    "IP_ADDRESS":       ("I", "cyan"),
+    "DOMAIN":           ("D", "green"),
+    "ONION_URL":        ("O", "magenta"),
+    "EMAIL_ADDRESS":    ("E", "yellow"),
+    "FILE_HASH_MD5":    ("H", "blue"),
+    "FILE_HASH_SHA1":   ("H", "blue"),
+    "FILE_HASH_SHA256": ("H", "blue"),
+    "BITCOIN_ADDRESS":  ("W", "yellow"),
+    "RANSOMWARE_GROUP": ("R", "red"),
+    "MALWARE_FAMILY":   ("M", "red"),
+    "CVE_NUMBER":       ("C", "red"),
+    "PHONE_NUMBER":     ("P", "grey50"),
+    "THREAT_ACTOR_HANDLE": ("@", "yellow"),
+    "PGP_KEY_BLOCK":    ("K", "grey50"),
 }
 
 
@@ -94,14 +97,29 @@ class EntityBrowserApp(App):
         self._title_text = inv.get("query") or data.get("query") or "investigation"
         self.entities: list[dict] = list(data.get("entities", []))
         self.relationships: list[dict] = list(data.get("relationships", []))
+        # Backend-computed community partition: {entity_id (str) → community_id (int)}.
+        # Stored in __init__ so _populate_table + ClustersScreen share the same view.
+        raw_communities = data.get("communities") or {}
+        self.communities: dict[str, int] = {
+            str(k): int(v) for k, v in raw_communities.items() if v is not None
+        }
+        self.community_count = int(data.get("community_count") or 0) or len(
+            set(self.communities.values())
+        )
         # Connection counts
         counts: Counter[str] = Counter()
         for r in self.relationships:
             counts[r["entity_a_id"]] += 1
             counts[r["entity_b_id"]] += 1
         self.connection_count = counts
+        # Stable secondary sort key so the table reads predictably even when
+        # community colouring is the primary visual cue.
         self.entities.sort(
-            key=lambda e: (-counts.get(e["id"], 0), -(e.get("confidence") or 0))
+            key=lambda e: (
+                self.communities.get(str(e.get("id")), -1),
+                -counts.get(e["id"], 0),
+                -(e.get("confidence") or 0),
+            )
         )
 
     def compose(self) -> ComposeResult:
@@ -118,7 +136,7 @@ class EntityBrowserApp(App):
     def on_mount(self) -> None:
         self.title = f"voidaccess — {self._title_text}"
         table: DataTable = self.query_one("#entity_table", DataTable)
-        table.add_columns("T", "Value", "Conn", "Badges")
+        table.add_columns("Cm", "T", "Value", "Conn", "Badges")
         self._populate_table()
 
     # -- helpers -----------------------------------------------------------
@@ -145,7 +163,11 @@ class EntityBrowserApp(App):
             val = (e.get("canonical_value") or e.get("value") or "")[:42]
             conn = self.connection_count.get(e["id"], 0)
             badges = " ".join(_badges_for_entity(e))
-            table.add_row(glyph, val, str(conn), badges, key=e["id"])
+            # Cm column: community id from the backend partition; blank when
+            # the entity isn't in any community (older investigations).
+            cm = self.communities.get(str(e.get("id")))
+            cm_label = f"[cyan]C{cm}[/cyan]" if cm is not None else ""
+            table.add_row(cm_label, glyph, val, str(conn), badges, key=e["id"])
 
     # -- input handlers ----------------------------------------------------
 
@@ -273,44 +295,62 @@ class ClustersScreen(ModalScreen):
         )
 
     def _render_clusters(self) -> str:
-        # Greedy connected-component clustering via the parent's edges
+        # Prefer the backend-computed community partition (deterministic
+        # greedy-modularity).  Falls back to connected-component clustering
+        # only when the investigation pre-dates the communities payload —
+        # i.e. for legacy exports loaded from older JSON files.
+        backend = self._parent_app.communities
+        entity_by_id = {str(e["id"]): e for e in self._parent_app.entities}
+
         adj: dict[str, set[str]] = defaultdict(set)
         for r in self._parent_app.relationships:
             adj[r["entity_a_id"]].add(r["entity_b_id"])
             adj[r["entity_b_id"]].add(r["entity_a_id"])
 
-        seen: set[str] = set()
-        clusters: list[list[str]] = []
-        for eid in adj:
-            if eid in seen:
-                continue
-            stack = [eid]
-            comp: list[str] = []
-            while stack:
-                node = stack.pop()
-                if node in seen:
+        if backend:
+            by_comm: dict[int, list[str]] = defaultdict(list)
+            for eid, cid in backend.items():
+                by_comm[cid].append(eid)
+            clusters = [sorted(members) for members in by_comm.values()]
+            clusters.sort(key=len, reverse=True)
+        else:
+            # Legacy fallback: greedy connected components.
+            seen: set[str] = set()
+            clusters_legacy: list[list[str]] = []
+            for eid in adj:
+                if eid in seen:
                     continue
-                seen.add(node)
-                comp.append(node)
-                stack.extend(adj.get(node, ()))
-            clusters.append(comp)
+                stack = [eid]
+                comp: list[str] = []
+                while stack:
+                    node = stack.pop()
+                    if node in seen:
+                        continue
+                    seen.add(node)
+                    comp.append(node)
+                    stack.extend(adj.get(node, ()))
+                clusters_legacy.append(comp)
+            clusters = sorted(clusters_legacy, key=len, reverse=True)
 
-        clusters.sort(key=len, reverse=True)
-        entity_by_id = {e["id"]: e for e in self._parent_app.entities}
-
-        lines = []
-        for idx, comp in enumerate(clusters[:10], start=1):
-            hub_id = max(comp, key=lambda x: len(adj.get(x, ())))
+        lines: list[str] = []
+        for idx, members in enumerate(clusters[:10], start=1):
+            hub_id = max(members, key=lambda x: len(adj.get(x, ())))
             hub = entity_by_id.get(hub_id, {})
-            hub_val = hub.get("canonical_value") or hub.get("value") or hub_id[:8]
+            hub_val = (
+                hub.get("canonical_value")
+                or hub.get("value")
+                or hub_id[:8]
+            )
             type_counts: Counter[str] = Counter()
-            for nid in comp:
+            for nid in members:
                 ent = entity_by_id.get(nid)
                 if ent:
                     type_counts[ent["entity_type"]] += 1
-            lines.append(
-                f"Cluster {chr(64 + idx)}: {hub_val}  (hub, {len(adj.get(hub_id, ()))} conn)"
+            header = (
+                f"Community {idx}: {hub_val}"
+                f"  (hub, {len(adj.get(hub_id, ()))} conn, {len(members)} entities)"
             )
+            lines.append(header)
             for etype, count in type_counts.most_common():
                 lines.append(f"  └── {count} {etype}")
             lines.append("")
@@ -331,46 +371,138 @@ class PathScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label("[b]Shortest path between two entities[/b]"),
-            Input(placeholder="first entity value", id="path_a"),
-            Input(placeholder="second entity value", id="path_b"),
+            Label("[b]Shortest path between two entities[/b]   (esc to close)"),
+            Input(placeholder="first entity value or id", id="path_a"),
+            Input(placeholder="second entity value or id", id="path_b"),
             Static("", id="path_result"),
         )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        a = self.query_one("#path_a", Input).value.strip().lower()
-        b = self.query_one("#path_b", Input).value.strip().lower()
+        a = self.query_one("#path_a", Input).value.strip()
+        b = self.query_one("#path_b", Input).value.strip()
         if not a or not b:
             return
         result = self._find_path(a, b)
         self.query_one("#path_result", Static).update(result)
 
     def _find_path(self, a_val: str, b_val: str) -> str:
+        # Build a NetworkX MultiDiGraph from the loaded JSON so we use the same
+        # directed→undirected fallback that the API path endpoint uses.  This
+        # lets the CLI match the backend's behaviour for analysts who run it
+        # offline (no server round-trip required).
+        try:
+            import networkx as nx
+            from graph.builder import find_shortest_path
+        except Exception as exc:  # pragma: no cover — defensive
+            return f"Path query unavailable: {exc}"
+
         ents = self._parent_app.entities
-        a_ent = next((e for e in ents if (e.get("canonical_value") or e.get("value") or "").lower() == a_val), None)
-        b_ent = next((e for e in ents if (e.get("canonical_value") or e.get("value") or "").lower() == b_val), None)
-        if a_ent is None or b_ent is None:
-            return "One or both entities not found in this investigation."
+        ents_by_id = {str(e["id"]): e for e in ents}
 
-        adj: dict[str, set[str]] = defaultdict(set)
+        G = nx.MultiDiGraph()
+        for e in ents:
+            G.add_node(
+                str(e["id"]),
+                entity_type=e.get("entity_type", ""),
+                canonical_value=e.get("canonical_value") or e.get("value") or "",
+            )
+        # Build a stable lookup from the user-typed value → entity id.
+        value_to_id: dict[str, str] = {}
+        for e in ents:
+            cv = (e.get("canonical_value") or "").lower()
+            v  = (e.get("value") or "").lower()
+            if cv:
+                value_to_id[cv] = str(e["id"])
+            if v and v not in value_to_id:
+                value_to_id[v] = str(e["id"])
+
         for r in self._parent_app.relationships:
-            adj[r["entity_a_id"]].add(r["entity_b_id"])
-            adj[r["entity_b_id"]].add(r["entity_a_id"])
+            src = str(r.get("entity_a_id", ""))
+            tgt = str(r.get("entity_b_id", ""))
+            if not src or not tgt:
+                continue
+            if not G.has_node(src) or not G.has_node(tgt):
+                continue
+            G.add_edge(
+                src,
+                tgt,
+                edge_type=r.get("relationship_type", ""),
+                confidence=float(r.get("confidence") or 0.0),
+            )
 
-        # BFS
-        queue = [(a_ent["id"], [a_ent["id"]])]
-        visited = {a_ent["id"]}
-        while queue:
-            node, path = queue.pop(0)
-            if node == b_ent["id"]:
-                ents_by_id = {e["id"]: e for e in ents}
-                arrow = " → ".join(
-                    (ents_by_id[n].get("canonical_value") or ents_by_id[n].get("value") or n)
-                    for n in path
-                )
-                return f"{arrow}\n({len(path) - 1} hops)"
-            for nxt in adj.get(node, ()):
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append((nxt, path + [nxt]))
-        return "No path between these entities."
+        def _resolve(value: str) -> "str | None":
+            if value in G:
+                return value  # already an entity id
+            return value_to_id.get(value.lower())
+
+        a_id = _resolve(a_val)
+        b_id = _resolve(b_val)
+        if a_id is None or b_id is None:
+            missing = []
+            if a_id is None:
+                missing.append(f"source: {a_val!r}")
+            if b_id is None:
+                missing.append(f"target: {b_val!r}")
+            return "Entity not found in this investigation: " + ", ".join(missing)
+
+        if a_id == b_id:
+            return "Source and target are the same entity."
+
+        node_path = find_shortest_path(G, a_id, b_id, max_hops=6)
+        if node_path is None:
+            return "No path found within 6 hops."
+
+        # Build a labelled chain with type glyphs and edge confidences, plus a
+        # plain arrow-only line for piping to other tools.
+        lines: list[str] = []
+        arrow_values: list[str] = []
+        for nid in node_path:
+            ent = ents_by_id.get(nid, {})
+            val = ent.get("canonical_value") or ent.get("value") or nid
+            arrow_values.append(val)
+
+        chain = " → ".join(arrow_values)
+        hops = len(node_path) - 1
+        lines.append(f"[b]Path:[/b] {chain}")
+        lines.append(f"[b]Hops:[/b] {hops}")
+        lines.append("")
+
+        # Visual card — uses TYPE_SHORT for the per-entity glyph + colour and
+        # pulls confidence + edge_type from the graph for the hop arrows.
+        lines.append("┌──────────────────────────────────────────────────────────┐")
+        for idx, nid in enumerate(node_path):
+            ent = ents_by_id.get(nid, {})
+            etype = ent.get("entity_type", "")
+            glyph, colour = TYPE_SHORT.get(etype, ("?", "white"))
+            val = (ent.get("canonical_value") or ent.get("value") or nid)[:32]
+            conf = float(ent.get("confidence") or 0.0)
+
+            if idx > 0:
+                prev = node_path[idx - 1]
+                edge_info = self._best_edge(G, prev, nid)
+                et = edge_info.get("type", "") or "RELATED"
+                ec = float(edge_info.get("confidence") or 0.0)
+                lines.append(f"│      ↓ {et} ({ec:.2f})")
+            tags = " ".join(_badges_for_entity(ent))
+            tag_suffix = f"  {tags}" if tags else ""
+            lines.append(f"│ [{colour}][{glyph}][/] {val:42} conf={conf:.2f}{tag_suffix}")
+        lines.append("└──────────────────────────────────────────────────────────┘")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _best_edge(G, source: str, target: str) -> dict:
+        """Pick the highest-confidence edge between source and target (either direction)."""
+        candidates: list[dict] = []
+        for u, v in ((source, target), (target, source)):
+            if G.has_edge(u, v):
+                # MultiDiGraph → dict-of-keys; flat-iterate
+                edge_dict = G.get_edge_data(u, v) or {}
+                for data in edge_dict.values():
+                    candidates.append(data)
+        if not candidates:
+            return {}
+        best = max(candidates, key=lambda d: float(d.get("confidence") or 0.0))
+        return {
+            "type": best.get("edge_type", ""),
+            "confidence": float(best.get("confidence") or 0.0),
+        }

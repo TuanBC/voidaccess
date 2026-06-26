@@ -13,11 +13,15 @@ from vector.model_singleton import get_embedding_model
 logger = logging.getLogger(__name__)
 
 _MAX_TOKENS = 512
+_EMBEDDER = None
 
 
 def get_embedder():
     """Return the shared SentenceTransformer instance, or None if unavailable."""
-    return get_embedding_model()
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        _EMBEDDER = get_embedding_model()
+    return _EMBEDDER
 
 
 def _truncate_to_model_limit(text: str, model) -> str:

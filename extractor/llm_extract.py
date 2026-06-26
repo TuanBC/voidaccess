@@ -240,29 +240,58 @@ async def extract_with_llm(
 
         result: dict[str, list[str]] = {k: list(v) for k, v in existing_entities.items()}
 
-        for chunk_idx, chunk in enumerate(chunks):
-            chunk_result = await _extract_chunk(chunk, llm)
+        # Collect raw chunk responses for per-chunk independent parsing
+        chunk_contents: list[str] = []
+        for chunk in chunks:
+            raw = await _extract_chunk(chunk, llm)
+            if raw:
+                chunk_contents.append(raw)
+
+        # Merge dict keyed by LLM output keys — each chunk parsed independently
+        merged: dict[str, list] = {key: [] for key in _LLM_KEY_TO_TYPE}
+
+        for raw_content in chunk_contents:
+            try:
+                cleaned = (
+                    raw_content.strip()
+                    .removeprefix("```json")
+                    .removeprefix("```")
+                    .strip()
+                    .removesuffix("```")
+                    .strip()
+                )
+                parsed = json.loads(cleaned)
+            except (json.JSONDecodeError, AttributeError):
+                logger.warning("LLM returned invalid JSON for chunk (len=%d)", len(raw_content))
+                continue
+
             for llm_key, entity_type in _LLM_KEY_TO_TYPE.items():
-                new_values = chunk_result.get(llm_key, [])
-                if not isinstance(new_values, list):
-                    continue
+                vals = parsed.get(llm_key, [])
+                if isinstance(vals, list):
+                    for v in vals:
+                        normalized = str(v).strip()
+                        if normalized:
+                            merged[llm_key].append(normalized)
+                            counts = entity_occurrences.get(entity_type, {})
+                            counts[normalized] = counts.get(normalized, 0) + 1
+                            entity_occurrences[entity_type] = counts
 
-                # Track occurrences for confidence scoring
-                for val in new_values:
-                    normalized = str(val).strip()
-                    if normalized:
-                        counts = entity_occurrences.get(entity_type, {})
-                        counts[normalized] = counts.get(normalized, 0) + 1
+        # Dedup each list after merge
+        for key in merged:
+            merged[key] = list(set(merged[key]))
 
-                existing = result.get(entity_type, [])
-                existing.extend(str(v) for v in new_values)
-                result[entity_type] = _dedup(existing)
+        # Merge LLM results into result dict (keyed by internal entity type)
+        for llm_key, entity_type in _LLM_KEY_TO_TYPE.items():
+            new_vals = merged[llm_key]
+            if new_vals:
+                existing_vals = result.get(entity_type, [])
+                existing_vals.extend(new_vals)
+                result[entity_type] = _dedup(existing_vals)
 
         # Store result in cache (even if empty)
         if not _get_cache_disabled(disable_cache):
             _save_to_cache(page_hash, result)
 
-        # Add confidence info via logging (could be extended to return metadata)
         _log_confidence_stats(entity_occurrences, len(chunks))
 
         return result
@@ -333,33 +362,16 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     return chunks
 
 
-async def _extract_chunk(chunk: str, llm) -> dict:
-    """
-    Send one chunk to the LLM and return the parsed JSON dict.
-
-    Returns an empty dict if the LLM returns invalid JSON or an error occurs.
-    """
+async def _extract_chunk(chunk: str, llm) -> str:
+    """Send one chunk to LLM and return raw response content. Returns '' on error."""
     try:
         prompt = _PROMPT_TEMPLATE.format(chunk=chunk)
         response = await llm.ainvoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
-        content = content.strip()
-
-        # Strip markdown code fences if the LLM wrapped output in them
-        if content.startswith("```"):
-            lines = content.split("\n", 1)
-            if len(lines) > 1:
-                content = lines[1]
-            content = content.rsplit("```", 1)[0].strip()
-
-        return json.loads(content)
-
-    except json.JSONDecodeError as exc:
-        logger.warning("LLM returned invalid JSON for chunk (len=%d): %s", len(chunk), exc)
-        return {}
+        return content.strip()
     except Exception as exc:
         logger.warning("LLM chunk extraction failed: %s", exc)
-        return {}
+        return ""
 
 
 def _dedup(values) -> list[str]:

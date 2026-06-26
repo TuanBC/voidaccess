@@ -173,8 +173,11 @@ def validate_config():
         raise RuntimeError(f"Missing required configuration keys: {', '.join(missing_required)}")
     for key in OPTIONAL_KEYS:
         val = _clean_env(key)
-        if val is None:
-            logger.debug(f"Optional configuration key '%s' is not set - related features will be disabled", key)
+        if val is None or val == "":
+            logger.warning(
+                "Optional configuration key '%s' is not set - related features will be disabled",
+                key,
+            )
 
 
 validate_config()

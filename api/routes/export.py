@@ -1,9 +1,16 @@
 """
-api/routes/export.py — Export endpoints for STIX, MISP, and Sigma.
+api/routes/export.py — Export endpoints for STIX, MISP, Sigma, YARA, Snort,
+                       Suricata, and the full IOC package.
 
-GET /export/{investigation_id}/stix  — download STIX 2.1 bundle as JSON
-GET /export/{investigation_id}/misp  — download MISP event as JSON
-GET /export/{investigation_id}/sigma — download Sigma rules as ZIP
+GET  /export/{investigation_id}/stix                       — STIX 2.1 bundle (JSON)
+GET  /export/{investigation_id}/misp                       — MISP event (JSON)
+GET  /export/{investigation_id}/sigma                      — Sigma rules (ZIP)
+GET  /export/{investigation_id}/yara                       — YARA rules (.yar)
+GET  /export/{investigation_id}/snort?format=snort|suricata — Snort/Suricata rules
+GET  /export/{investigation_id}/package                    — full IOC package (ZIP)
+
+POST /export/{investigation_id}/<fmt>/selected             — same exports restricted
+                                                            to a chosen entity subset
 """
 
 from __future__ import annotations
@@ -11,10 +18,11 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import uuid
 import zipfile
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from api.auth import CurrentUser, get_current_user
@@ -322,6 +330,176 @@ async def export_sigma_selected(
         raise HTTPException(status_code=500, detail="Sigma export failed")
 
 
+@router.get("/{investigation_id}/yara")
+async def export_yara(
+    investigation_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Response:
+    """
+    Return YARA rules file as a text/plain download.
+
+    Content-Type: text/plain
+    Content-Disposition: attachment; filename="voidaccess-{query}.yar"
+    """
+    _check_investigation_owner(investigation_id, current_user)
+    _validate_uuid(investigation_id)
+    try:
+        from export.yara_export import generate_yara_rules
+        from export.stix import _load_entities_for_investigation  # noqa: PLC0415
+
+        internal_id = _resolve_internal_investigation_id(investigation_id)
+        entities = _load_entities_for_investigation(str(internal_id))
+        investigation_dict = _load_investigation_meta(internal_id)
+        yara_text = generate_yara_rules(entities, investigation_dict)
+        filename = _safe_download_filename(
+            investigation_dict, investigation_id, suffix=".yar"
+        )
+        return Response(
+            content=yara_text,
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("export_yara failed: %s", exc)
+        raise HTTPException(status_code=500, detail="YARA export failed")
+
+
+@router.get("/{investigation_id}/snort")
+async def export_snort(
+    investigation_id: str,
+    format: str = Query(
+        "snort",
+        pattern="^(snort|suricata)$",
+        description="Snort (default) or Suricata rule format.",
+    ),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Response:
+    """
+    Return Snort or Suricata detection rules as a text/plain download.
+
+    Use ``?format=suricata`` to switch to the Suricata flavour (adds a
+    ``metadata:`` block and emits ``tls.sni`` / ``filemd5:`` rules).
+    """
+    _check_investigation_owner(investigation_id, current_user)
+    _validate_uuid(investigation_id)
+    try:
+        from export.snort_export import generate_snort_rules
+        from export.stix import _load_entities_for_investigation  # noqa: PLC0415
+
+        internal_id = _resolve_internal_investigation_id(investigation_id)
+        entities = _load_entities_for_investigation(str(internal_id))
+        investigation_dict = _load_investigation_meta(internal_id)
+        rules_text = generate_snort_rules(
+            entities,
+            investigation_dict,
+            format=format,
+        )
+        suffix = ".rules"
+        filename = _safe_download_filename(
+            investigation_dict, investigation_id, suffix=suffix
+        )
+        return Response(
+            content=rules_text,
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("export_snort failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Snort export failed")
+
+
+@router.get("/{investigation_id}/package")
+async def export_package(
+    investigation_id: str,
+    tlp: str = Query(
+        "white",
+        pattern="^(white|green|amber|red)$",
+        description="Traffic Light Protocol marker (TLP:WHITE default).",
+    ),
+    redact_credentials: bool = Query(
+        True,
+        description="Partially redact credential values in the package.",
+    ),
+    include_raw: bool = Query(
+        False,
+        description="Include raw scraped page content under pages/ in the ZIP.",
+    ),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> StreamingResponse:
+    """
+    Generate a full IOC package ZIP for the investigation.
+
+    Returns a streaming ZIP download containing:
+      README.md, metadata.json, iocs/*, threat_intel/* (STIX, MISP),
+      detections/* (Sigma, Snort, YARA), reports/* (summary, entities CSV),
+      and optionally pages/* raw content.
+
+    Content-Type: application/zip
+    Content-Disposition: attachment; filename="voidaccess-{query}-{date}.zip"
+    """
+    _check_investigation_owner(investigation_id, current_user)
+    _validate_uuid(investigation_id)
+    try:
+        from export.ioc_package import (
+            build_package_filename,
+            generate_ioc_package,
+        )
+        from export.stix import _load_entities_for_investigation  # noqa: PLC0415
+
+        internal_id = _resolve_internal_investigation_id(investigation_id)
+        entities = _load_entities_for_investigation(str(internal_id))
+
+        # Load the investigation record for header metadata.
+        investigation_dict: dict = {
+            "id": str(internal_id),
+            "query": "",
+            "summary": "",
+            "sources_used": {},
+            "created_at": None,
+        }
+        try:
+            from db.session import get_session  # noqa: PLC0415
+            from db.queries import get_investigation_by_id_or_run  # noqa: PLC0415
+            with get_session() as session:
+                inv = get_investigation_by_id_or_run(session, internal_id)
+                if inv is not None:
+                    investigation_dict["id"] = str(inv.id)
+                    investigation_dict["run_id"] = str(inv.run_id) if inv.run_id else None
+                    investigation_dict["query"] = inv.query or ""
+                    investigation_dict["summary"] = inv.summary or ""
+                    investigation_dict["created_at"] = (
+                        inv.created_at.isoformat() if inv.created_at else None
+                    )
+        except Exception as exc:
+            logger.warning("export_package: investigation lookup failed: %s", exc)
+
+        zip_bytes = await generate_ioc_package(
+            investigation_id=str(internal_id),
+            entities=entities,
+            investigation=investigation_dict,
+            session=None,
+            tlp=tlp,
+            redact_credentials=redact_credentials,
+            include_raw=include_raw,
+        )
+
+        filename = build_package_filename(investigation_dict, str(internal_id))
+        return StreamingResponse(
+            io.BytesIO(zip_bytes),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("export_package failed: %s", exc)
+        raise HTTPException(status_code=500, detail="IOC package export failed")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -357,3 +535,54 @@ def _validate_uuid(value: str) -> None:
         uuid.UUID(value)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid investigation ID format")
+
+
+def _load_investigation_meta(internal_id: uuid.UUID) -> dict:
+    """Return a dict with id / query / summary / created_at for the investigation.
+
+    Returns a minimal placeholder dict when the investigation or DB is
+    unavailable so that downstream exporters (YARA, Snort) can still
+    render a syntactically valid file with whatever metadata they have.
+    """
+    meta: dict = {
+        "id": str(internal_id),
+        "query": "",
+        "summary": "",
+        "created_at": None,
+    }
+    try:
+        from db.session import get_session  # noqa: PLC0415
+        from db.queries import get_investigation_by_id_or_run  # noqa: PLC0415
+
+        with get_session() as session:
+            inv = get_investigation_by_id_or_run(session, internal_id)
+            if inv is not None:
+                meta["id"] = str(inv.id)
+                meta["run_id"] = str(inv.run_id) if inv.run_id else None
+                meta["query"] = inv.query or ""
+                meta["summary"] = inv.summary or ""
+                meta["created_at"] = (
+                    inv.created_at.isoformat() if inv.created_at else None
+                )
+    except Exception as exc:
+        logger.warning("_load_investigation_meta failed: %s", exc)
+    return meta
+
+
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_download_filename(
+    investigation: dict,
+    investigation_id: str,
+    *,
+    suffix: str,
+) -> str:
+    """Return ``voidaccess-{query}-{id}{suffix}`` with a query segment that's
+    safe to use as a Content-Disposition filename."""
+    raw_query = (investigation or {}).get("query") or ""
+    segment = _FILENAME_SAFE.sub("-", raw_query).strip("-_")
+    if not segment:
+        segment = investigation_id[:8] or "investigation"
+    segment = segment[:60]
+    return f"voidaccess-{segment}{suffix}"

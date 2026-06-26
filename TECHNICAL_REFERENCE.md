@@ -12,13 +12,14 @@ This document describes the current state of the VoidAccess codebase. It is inte
 4. [Entity Extraction](#4-entity-extraction)
 5. [Enrichment Sources](#5-enrichment-sources)
 6. [Graph System](#6-graph-system)
-7. [Content Safety](#7-content-safety)
-8. [Data Quality Features](#8-data-quality-features)
-9. [Export Formats](#9-export-formats)
-10. [Monitoring System](#10-monitoring-system)
-11. [API Reference](#11-api-reference)
-12. [Configuration Reference](#12-configuration-reference)
-13. [Known Limitations](#13-known-limitations)
+7. [Actor Intelligence Layer](#7-actor-intelligence-layer)
+8. [Content Safety](#8-content-safety)
+9. [Data Quality Features](#9-data-quality-features)
+10. [Export Formats](#10-export-formats)
+11. [Monitoring System](#11-monitoring-system)
+12. [API Reference](#12-api-reference)
+13. [Configuration Reference](#13-configuration-reference)
+14. [Known Limitations](#14-known-limitations)
 
 ---
 
@@ -247,10 +248,14 @@ pip install voidaccess
 |---|---|---|
 | `voidaccess investigate "<query>"` | `--output`, `--model`, `--no-tor`, `--no-llm`, `--depth`, `--format`, `--quiet`, `--no-banner` | Runs the full local pipeline and writes report files |
 | `voidaccess show [target]` | `--no-tui` | Opens the entity browser, or prints a summary table for scripted use |
-| `voidaccess export <target>` | `--format`, `--output` | Exports STIX, MISP, Sigma, CSV, MD, or JSON from a saved investigation |
+| `voidaccess export <target>` | `--format stix|misp|sigma|yara|snort|suricata|package|csv|md|json`, `--output`, `--tlp`, `--redact-credentials`, `--include-raw` | Exports a saved investigation or JSON report |
+| `voidaccess package <target>` | `--output`, `--tlp`, `--redact-credentials`, `--include-raw` | Shortcut for `voidaccess export <target> --format package`; writes an IOC ZIP bundle |
 | `voidaccess enrich <target>` | `--skip-ips`, `--skip-domains`, `--skip-hashes`, `--skip-emails` | Re-runs post-processing enrichment against current feeds |
 | `voidaccess list` | `--limit`, `--json` | Lists saved investigations from the local SQLite DB |
-| `voidaccess status` | top-level `--no-banner` | Shows config, API key status, Tor reachability, and spaCy status |
+| `voidaccess status` | `--engines`, `--cache`, `--seeds`, top-level `--no-banner` | Shows config, API key status, Tor reachability, spaCy status, search engine stats, cache stats, or seed pool status |
+| `voidaccess actors` | `--limit`, `--search`, `--json` | Lists persistent actor profiles |
+| `voidaccess actor <handle>` | `--json`, `--timeline`, `--event-types`, `--note` | Shows, timelines, or annotates one actor profile |
+| `voidaccess timeline <handle>` | `--limit`, `--event-types`, `--json` | Shortcut for `voidaccess actor <handle> --timeline` |
 | `voidaccess configure` | `llm`, `keys`, `tor` | First-run wizard and targeted configuration subcommands |
 
 #### Tor Detection
@@ -318,9 +323,9 @@ The `current_step` field in the `investigations` table uses these labels. The UI
 - `SeedManager.get_relevant_seeds()` scores `data/onion_seeds.json` entries against the query by tag and name matching; returns up to 10 relevant seeds.
 - Seed URLs are prepended to the scrape queue; they bypass the LLM filter.
 
-**Steps 2–4 (parallel) — 7 concurrent tasks with a 300-second hard cap**
+**Steps 2-4 (parallel) - 7 concurrent tasks with a configurable hard cap**
 
-All 7 tasks run simultaneously via `asyncio.gather(..., return_exceptions=True)`. One task failing never cancels the others. The 300s cap applies to the entire group; each task also has its own inner timeout.
+All 7 tasks run simultaneously via `asyncio.gather(..., return_exceptions=True)`. One task failing never cancels the others. The group cap defaults to 300 seconds and is controlled by `VOIDACCESS_PARALLEL_SOURCES_TIMEOUT`; each task also has its own inner timeout.
 
 | Task | Inner timeout | Description |
 |---|---|---|
@@ -404,23 +409,48 @@ Cancellation checkpoint after this step.
 **Step 6.8 — DNS/WHOIS enrichment**
 - Calls `sources.dns_enrichment.enrich_with_dns()` on extracted IP and domain entities (up to 20 IPs, 20 domains).
 - Queries CIRCL PDNS, CIRCL PSSL, and RDAP. Optionally queries SecurityTrails.
-- Populates `infrastructure_clusters` in the in-process `_infra_cluster_cache`; updates `sources_used`.
+- Persists `infrastructure_clusters` and `sources_used` in investigation metadata while keeping in-process caches as the fast path.
+
+**Step 6.9 - Persistent actor profiles**
+- `sources.actor_profiles.ActorProfileManager` upserts extracted actor handles into `actor_profiles`.
+- Co-occurring aliases and infrastructure are written to `actor_aliases` and `actor_infrastructure`.
+- `run_alias_resolution()` adds likely or confirmed alias rows when the composite signal score is high enough.
 
 **Step 7 — Graph construction**
 - `graph.builder.build_graph_from_db()` builds a NetworkX `MultiDiGraph` from DB entities.
 - `persist_graph_edges()` writes edges to `entity_relationships`.
 - Edge overflow rules apply (see Section 6).
+- Runs deterministic backend community detection for the graph API response.
 - Sets `graph_status` to `built` or `skipped_overflow`.
 
 **Step 8 — LLM summary**
-- `generate_summary()` produces a structured threat intelligence briefing from all extracted pages and entities.
+- `generate_summary()` produces a structured threat intelligence briefing from all extracted pages and entities. The phase timeout defaults to 90 seconds and is controlled by `VOIDACCESS_SUMMARY_TIMEOUT`.
 - Falls back to a plain count summary if the LLM call fails.
 
 **Step 9 — Finalise**
-- Marks investigation `completed`; updates `sources_used_cache`.
+- Marks investigation `completed`; updates `sources_used_cache`. The phase timeout defaults to 30 seconds and is controlled by `VOIDACCESS_FINALIZE_TIMEOUT`.
 - On any unhandled exception, marks `failed` and stores the error message in `summary`.
 
-### 2.4 Cancellation
+### 2.4 Phase Timeouts and Recovery
+
+The API and CLI wrap the major long-running phases in configurable timeouts:
+
+| Phase | Env var | Default |
+|---|---|---|
+| Parallel collection sources | `VOIDACCESS_PARALLEL_SOURCES_TIMEOUT` | `300` seconds |
+| Enrichment | `VOIDACCESS_ENRICHMENT_TIMEOUT` | `120` seconds |
+| Graph build | `VOIDACCESS_GRAPH_TIMEOUT` | `60` seconds |
+| Summary | `VOIDACCESS_SUMMARY_TIMEOUT` | `90` seconds |
+| Finalize | `VOIDACCESS_FINALIZE_TIMEOUT` | `30` seconds |
+
+Pipeline metadata that used to live only in process memory now survives restarts through the investigation metadata JSON column:
+
+- `sources_used`
+- `infrastructure_clusters`
+
+At API startup, and every `VOIDACCESS_SWEEP_INTERVAL_SECONDS` seconds thereafter, the stuck-investigation sweep marks runs older than `VOIDACCESS_INVESTIGATION_HARD_TIMEOUT_MINUTES` as failed. Defaults are 300 seconds between sweeps and 30 minutes for the hard timeout.
+
+### 2.5 Cancellation
 
 `POST /investigations/{id}/cancel` sets `_cancel_flags[investigation_id] = True`.
 
@@ -495,31 +525,86 @@ Regex results take precedence over NER results for shared entity types.
 
 ### 4.2 Entity Types
 
-The following entity type strings appear in the codebase. The `TYPE_PRIORITY` map controls how conflicting extractions are resolved when an entity's type is ambiguous.
+VoidAccess v1.5.0 recognises 55+ entity type strings. The `TYPE_PRIORITY` map controls conflict resolution when an entity's type is ambiguous.
 
-**Priority 1 — Critical IOCs** (highest precedence in conflict resolution)
+#### Critical IOCs
 
-`CVE`, `CVE_NUMBER`, `IP_ADDRESS`, `IPV6_ADDRESS`, `FILE_HASH`, `FILE_HASH_MD5`, `FILE_HASH_SHA1`, `FILE_HASH_SHA256`, `FILE_HASH_SHA512`, `ONION_URL`, `DOMAIN`, `DOMAIN_NAME`
+| Entity type | Description |
+|---|---|
+| `CVE`, `CVE_NUMBER` | CVE identifiers |
+| `IP_ADDRESS` | IPv4 address |
+| `IPV6_ADDRESS` | IPv6 address |
+| `DOMAIN`, `DOMAIN_NAME` | DNS names |
+| `ONION_URL` | Tor onion URLs and hostnames |
+| `FILE_HASH`, `FILE_HASH_MD5`, `FILE_HASH_SHA1`, `FILE_HASH_SHA256`, `FILE_HASH_SHA512` | File hashes |
+| `MAC_ADDRESS` | Colon, hyphen, or Cisco-style MAC address |
+| `IPFS_CID` | IPFS CIDv0/CIDv1 content identifiers |
+| `COMBO_LIST_ENTRY` | Credential combo-list record |
+| `YARA_RULE` | YARA rule name or rule block marker |
+| `MITRE_TACTIC`, `MITRE_TECHNIQUE` | ATT&CK tactic or technique IDs |
+| `EXPLOIT_DB_ID` | Exploit-DB identifier |
+| `NUCLEI_TEMPLATE` | Nuclei template identifier |
 
-**Priority 2 — Threat actors**
+#### Cryptocurrency
 
-`MALWARE_FAMILY`, `RANSOMWARE_GROUP`, `THREAT_ACTOR`, `THREAT_ACTOR_HANDLE`
+| Entity type | Description |
+|---|---|
+| `BITCOIN_ADDRESS` | Bitcoin address |
+| `ETHEREUM_ADDRESS` | Ethereum address |
+| `MONERO_ADDRESS` | Monero address |
+| `LITECOIN_ADDRESS` | Litecoin address |
+| `ZCASH_ADDRESS` | Zcash address |
+| `DOGECOIN_ADDRESS` | Dogecoin address |
+| `XRP_ADDRESS` | XRP classic address |
+| `SOLANA_ADDRESS` | Solana address |
+| `TRON_ADDRESS` | Tron address |
+| `BITCOIN_CASH_ADDRESS` | Bitcoin Cash cashaddr |
+| `DASH_ADDRESS` | Dash address |
+| `ENS_DOMAIN` | Ethereum Name Service `.eth` name |
+| `WALLET`, `CRYPTO_WALLET` | Generic wallet type |
+| `CRYPTO_SEED_PHRASE` | Detected seed phrase marker |
 
-**Priority 3 — Cryptocurrency**
+#### Credentials
 
-`BITCOIN_ADDRESS`, `MONERO_ADDRESS`, `ETHEREUM_ADDRESS`, `WALLET`
+| Entity type | Description |
+|---|---|
+| `AWS_ACCESS_KEY` | AWS access key ID |
+| `AWS_SECRET_KEY` | AWS secret key candidate |
+| `GITHUB_TOKEN` | GitHub token |
+| `SLACK_TOKEN` | Slack token |
+| `DISCORD_TOKEN` | Discord bot/user token pattern |
+| `JWT_TOKEN` | JWT bearer token |
+| `GOOGLE_API_KEY` | Google API key |
+| `STRIPE_KEY` | Stripe live/test key |
+| `API_KEY` | Generic API key with context |
+| `STEALER_LOG_ENTRY` | Stealer-log URL/login/password marker |
 
-**Priority 4 — Identity markers**
+#### Messaging Handles
 
-`EMAIL_ADDRESS`, `PGP_KEY_BLOCK`
+| Entity type | Description |
+|---|---|
+| `TELEGRAM_HANDLE` | Telegram username |
+| `DISCORD_HANDLE` | Discord legacy username/discriminator |
+| `XMPP_JID` | XMPP/Jabber ID |
+| `TOX_ID` | Tox ID |
+| `SESSION_ID` | Session messenger ID |
+| `MATRIX_HANDLE` | Matrix user handle |
+| `WIRE_HANDLE` | Wire handle |
+| `ICQ_NUMBER` | ICQ number |
+| `WICKR_ID` | Wickr handle |
 
-**Priority 5 — Organisations and people**
+#### Actors and Identity
 
-`ORGANIZATION_NAME`, `PERSON_NAME`
-
-**Unranked** (recognised by the graph builder but absent from the priority map)
-
-`DATE`, `PASTE_URL`, `PHONE_NUMBER`, `MITRE_TECHNIQUE`
+| Entity type | Description |
+|---|---|
+| `MALWARE_FAMILY`, `RANSOMWARE_GROUP` | Malware or ransomware family/group names |
+| `THREAT_ACTOR`, `THREAT_ACTOR_HANDLE` | Actor names and handles |
+| `EMAIL_ADDRESS` | Email address |
+| `PGP_KEY_BLOCK` | PGP public key block or fingerprint |
+| `ORGANIZATION_NAME`, `PERSON_NAME` | Named organisations and people |
+| `PHONE_NUMBER` | Phone number |
+| `DATE` | Date mention |
+| `PASTE_URL` | Paste-site URL |
 
 ### 4.3 Per-Type Sub-Caps
 
@@ -720,9 +805,81 @@ Return statuses: `written`, `pruned`, `skipped_overflow`.
 | `skipped_overflow` | Edge count exceeded 50,000; graph skipped |
 | `no_data` | Investigation completed with no results |
 
+### 6.6 Backend Community Detection
+
+The graph API computes communities server-side before returning the graph payload. The response includes:
+
+- `communities`: map of `node_id` to deterministic community ID
+- `community_count`: number of detected communities
+
+The frontend uses backend communities as the preferred partition and falls back to client-side Louvain only when the backend field is absent.
+
+### 6.7 Path Between Nodes
+
+`GET /investigations/{id}/graph/path?from=entity&to=entity&max_hops=6` finds the shortest path between two entity values inside one investigation graph.
+
+The response includes `found`, `path_length`, ordered `nodes`, ordered `edges`, `from_entity`, `to_entity`, `max_hops`, `directed`, and `message`. The backend first attempts a directed path and then uses an undirected fallback. The CLI browser `[P]` path finder and the frontend Find Path button both use this endpoint and highlight the returned subgraph.
+
 ---
 
-## 7. Content Safety
+## 7. Actor Intelligence Layer
+
+### 7.1 Data Model
+
+Persistent actor intelligence uses three tables:
+
+| Table | Purpose |
+|---|---|
+| `actor_profiles` | One row per canonical handle, with first/last seen timestamps, investigation count, confidence, and analyst notes |
+| `actor_aliases` | Alternate handles, PGP fingerprints, emails, wallets, domains, and manually confirmed aliases |
+| `actor_infrastructure` | IPs, IPv6 addresses, domains, onion URLs, PGP keys, wallets, and credential-related infrastructure linked to an actor |
+
+Profiles are populated from `THREAT_ACTOR`, `THREAT_ACTOR_HANDLE`, `RANSOMWARE_GROUP`, and related entities during investigations. Handles below the actor-profile confidence threshold are skipped to reduce noisy profiles.
+
+### 7.2 Cross-Alias Resolution
+
+`sources.actor_profiles.run_alias_resolution()` scores candidate actor merges using five signals:
+
+| Signal | Meaning |
+|---|---|
+| Shared infrastructure | Both profiles link to the same IP, domain, onion URL, wallet, or other infrastructure |
+| Shared PGP | Both profiles link to the same PGP key or fingerprint |
+| String similarity | Canonical handles or aliases are similar |
+| Temporal co-activity | Profiles were observed within the same activity window |
+| Co-investigation | Both profiles appeared in at least one shared investigation |
+
+Candidates at or above 0.75 become `likely_same_actor`; candidates at or above 0.90 become `confirmed_same_actor`. Manual alias additions default to confirmed confidence.
+
+### 7.3 Timeline Derivation
+
+Actor timelines are computed from existing data rather than stored as a separate table. Events include first seen, investigation appearances, new aliases, new infrastructure, and analyst notes. CLI and API callers can limit event count and filter by event type.
+
+### 7.4 API Endpoints
+
+```
+GET  /actors
+GET  /actors/{handle}
+GET  /actors/{handle}/investigations
+GET  /actors/{handle}/timeline
+GET  /actors/{handle}/aliases
+POST /actors/{handle}/aliases
+POST /actors/{handle}/notes
+```
+
+### 7.5 CLI Commands
+
+```bash
+voidaccess actors
+voidaccess actors --search lockbit
+voidaccess actor lockbit
+voidaccess actor lockbit --timeline
+voidaccess actor lockbit --note "Observed reuse of leak-site infrastructure"
+voidaccess timeline lockbit
+```
+
+---
+
+## 8. Content Safety
 
 Six mandatory layers. None can be disabled via configuration.
 
@@ -744,9 +901,9 @@ Technical IOC types (hashes, IPs, CVEs, wallet addresses, onion URLs) are intent
 
 ---
 
-## 8. Data Quality Features
+## 9. Data Quality Features
 
-### 8.1 IOC Freshness Decay
+### 9.1 IOC Freshness Decay
 
 `utils/ioc_freshness.py` assigns a `FreshnessTag` to entities based on `last_seen_at` and entity type:
 
@@ -763,11 +920,11 @@ Technical IOC types (hashes, IPs, CVEs, wallet addresses, onion URLs) are intent
 
 Tags: `fresh`, `aging`, `stale`, `expired`, `unknown`
 
-### 8.2 Cross-Source Confidence
+### 9.2 Cross-Source Confidence
 
 `Entity.source_count` tracks how many distinct sources corroborated an entity. `Entity.corroborating_sources` stores the source names. Higher source counts increase effective confidence during triage.
 
-### 8.3 Defanged Output
+### 9.3 Defanged Output
 
 `utils/defang.py` provides:
 
@@ -779,7 +936,7 @@ Tags: `fresh`, `aging`, `stale`, `expired`, `unknown`
 
 Defanging is applied to the frontend display when the `defang` toggle is enabled (`defangEnabled` state in the investigation page, defaulting to `true`). It is not applied to DB storage.
 
-### 8.4 Sources Panel
+### 9.4 Sources Panel
 
 The investigation detail endpoint returns `sources_used` — a dict showing which intelligence sources ran and what they found:
 
@@ -815,19 +972,19 @@ The investigation detail endpoint returns `sources_used` — a dict showing whic
 
 Possible status values: `ok_N_results`, `ok_N_pages`, `ok_N_enrichments`, `skipped_no_key`, `skipped_disabled`, `error`, `pending`.
 
-### 8.5 Infrastructure Cluster Detection
+### 9.5 Infrastructure Cluster Detection
 
 After DNS enrichment, entities sharing the same ASN, CIDR block, or WHOIS registrant are grouped into clusters. Clusters appear in `investigation.infrastructure_clusters` and are surfaced in the `InfrastructureClusters` UI component.
 
-The cluster data is stored in the in-process `_infra_cluster_cache` dict and is lost on container restart.
+The cluster data is persisted in investigation metadata and mirrored in the in-process `_infra_cluster_cache` dict for fast reads. Completed investigations keep `infrastructure_clusters` and `sources_used` after container restart.
 
 ---
 
-## 9. Export Formats
+## 10. Export Formats
 
 All export endpoints are at `/export/{id}/{format}` and require a valid JWT.
 
-### 9.1 STIX 2.1
+### 10.1 STIX 2.1
 
 `export/stix.py` produces a STIX 2.1 Bundle containing:
 
@@ -837,7 +994,7 @@ All export endpoints are at `/export/{id}/{format}` and require a valid JWT.
 - `Relationship` objects derived from `entity_relationships`
 - `Report` object with the investigation summary and referenced objects
 
-### 9.2 MISP JSON
+### 10.2 MISP JSON
 
 `export/misp.py` produces a MISP-compatible event JSON:
 
@@ -846,7 +1003,7 @@ All export endpoints are at `/export/{id}/{format}` and require a valid JWT.
 - Galaxy clusters for malware families and threat actors
 - Tags from OTX pulse tags and MITRE ATT&CK technique IDs
 
-### 9.3 Sigma Rules
+### 10.3 Sigma Rules
 
 `export/sigma.py` auto-generates Sigma YAML detection rules from extracted IOCs:
 
@@ -854,17 +1011,94 @@ All export endpoints are at `/export/{id}/{format}` and require a valid JWT.
 - File-level rules for hashes
 - One rule per high-confidence indicator
 
-### 9.4 CSV
+### 10.4 CSV
 
 Flat entity dump with columns:
 
 `entity_type`, `value`, `canonical_value`, `confidence`, `first_seen`, `last_seen`, `source_count`, `corroborating_sources`, `context_snippet`
 
+### 10.5 YARA Rules
+
+`export/yara_export.py` generates `.yar` output from investigation entities. Rule generation covers malware-family strings, file hashes, credential markers, infrastructure strings, and high-confidence IOC content. Credential-like values are escaped and bounded for rule safety; use the IOC package when raw text lists are required.
+
+API:
+
+```
+GET /export/{id}/yara
+```
+
+CLI:
+
+```bash
+voidaccess export <file-or-id> --format yara
+```
+
+### 10.6 Snort and Suricata Rules
+
+`export/snort_export.py` generates `.rules` output for both Snort and Suricata. Rule types include IP, domain, URL, hash/string, and credential-oriented content matches where a network signature can be expressed safely.
+
+API:
+
+```
+GET /export/{id}/snort?format=snort
+GET /export/{id}/snort?format=suricata
+```
+
+CLI:
+
+```bash
+voidaccess export <file-or-id> --format snort
+voidaccess export <file-or-id> --format suricata
+```
+
+### 10.7 IOC Package Export
+
+`export/ioc_package.py` builds a ZIP bundle with 21 standard files:
+
+| Path | Contents |
+|---|---|
+| `README.md` | Package overview and file index |
+| `metadata.json` | Package metadata, TLP, counts, and source summary |
+| `iocs/hashes.txt` | MD5, SHA1, and SHA256 values |
+| `iocs/ip_addresses.txt` | IPv4 indicators |
+| `iocs/ipv6_addresses.txt` | IPv6 indicators |
+| `iocs/domains.txt` | Domain indicators |
+| `iocs/onion_urls.txt` | Onion URLs |
+| `iocs/email_addresses.txt` | Email indicators |
+| `iocs/urls.txt` | URL indicators |
+| `iocs/crypto_wallets.txt` | Crypto wallet indicators |
+| `iocs/credentials.txt` | Partially redacted credential indicators |
+| `iocs/cve_identifiers.txt` | CVE IDs |
+| `iocs/mitre_techniques.txt` | MITRE ATT&CK IDs |
+| `threat_intel/stix.json` | STIX 2.1 bundle |
+| `threat_intel/misp.json` | MISP event JSON |
+| `detections/sigma.yml` | Sigma rules |
+| `detections/yara.yar` | YARA rules |
+| `detections/snort.rules` | Snort rules |
+| `detections/suricata.rules` | Suricata rules |
+| `reports/summary.md` | Investigation summary |
+| `reports/entities.csv` | Full entity CSV |
+
+Credential redaction is enabled by default for package exports. Use `--no-redact-credentials` only when the operator explicitly needs raw credential values in the bundle. Raw scraped page content is excluded by default and only added when `--include-raw` is passed.
+
+API:
+
+```
+GET /export/{id}/package
+```
+
+CLI:
+
+```bash
+voidaccess package <file-or-id>
+voidaccess export <file-or-id> --format package
+```
+
 ---
 
-## 10. Monitoring System
+## 11. Monitoring System
 
-### 10.1 How Monitors Work
+### 11.1 How Monitors Work
 
 Monitors are defined in `data/monitors.yaml`. Each monitor has:
 
@@ -877,7 +1111,7 @@ Monitors are defined in `data/monitors.yaml`. Each monitor has:
 
 **URL watches** (`monitor/jobs.py:run_url_watch`): scrape a specific URL over Tor; diff the extracted text using `monitor/diff.py`; fire alerts on significant changes.
 
-### 10.2 Scheduling
+### 11.2 Scheduling
 
 `monitor/scheduler.py` starts an `apscheduler.schedulers.asyncio.AsyncIOScheduler` at API startup. Jobs:
 
@@ -887,7 +1121,7 @@ Monitors are defined in `data/monitors.yaml`. Each monitor has:
 
 `max_instances=1` and `coalesce=True` prevent overlapping runs of the same watch.
 
-### 10.3 Alert Delivery
+### 11.3 Alert Delivery
 
 `monitor/alerts.py` dispatches alerts through configured channels:
 
@@ -898,11 +1132,11 @@ Alert records are persisted to `monitor_alerts`. The `delivered` field tracks wh
 
 ---
 
-## 11. API Reference
+## 12. API Reference
 
 All routes except `/auth/*`, `/health`, `/healthz/*` require `Authorization: Bearer <token>`.
 
-### 11.1 Authentication
+### 12.1 Authentication
 
 ```
 POST /auth/login        — { email, password } → { access_token, token_type }
@@ -910,35 +1144,52 @@ POST /auth/logout       — blacklists the current token
 POST /auth/register     — create account (admin only in default config)
 ```
 
-### 11.2 Investigations
+### 12.2 Investigations
 
 ```
 POST   /investigations                         — trigger investigation (3/min rate limit)
 GET    /investigations                         — list investigations (paginated)
 GET    /investigations/{id}                    — investigation detail + sources_used + clusters
 GET    /investigations/{id}/entities           — entity list (filterable by type, confidence)
-GET    /investigations/{id}/graph              — graph JSON (nodes + edges)
+GET    /investigations/{id}/graph              — graph JSON (nodes + edges + communities)
+GET    /investigations/{id}/graph/path         — shortest path between two entity values
 POST   /investigations/{id}/cancel             — request cancellation
 DELETE /investigations/{id}                    — delete investigation and all associated data
 ```
 
-### 11.3 Entities
+### 12.3 Entities
 
 ```
 GET    /entities                               — global entity search
 GET    /entities/{id}                          — entity detail
 ```
 
-### 11.4 Export
+### 12.4 Export
 
 ```
 GET    /export/{id}/stix                       — STIX 2.1 JSON bundle
 GET    /export/{id}/misp                       — MISP event JSON
 GET    /export/{id}/sigma                      — Sigma YAML rules (zip)
+GET    /export/{id}/yara                       — YARA rules
+GET    /export/{id}/snort?format=snort         — Snort rules
+GET    /export/{id}/snort?format=suricata      — Suricata rules
+GET    /export/{id}/package                    — IOC package ZIP
 GET    /export/{id}/csv                        — entity CSV
 ```
 
-### 11.5 Monitors
+### 12.5 Actors
+
+```
+GET    /actors                                 — list or search actor profiles
+GET    /actors/{handle}                        — full actor profile
+GET    /actors/{handle}/investigations         — investigations linked to actor
+GET    /actors/{handle}/timeline               — derived actor activity timeline
+GET    /actors/{handle}/aliases                — alias candidates grouped by confidence tier
+POST   /actors/{handle}/aliases                — manually add or confirm alias
+POST   /actors/{handle}/notes                  — append analyst note
+```
+
+### 12.6 Monitors
 
 ```
 GET    /monitors                               — list configured watches + job status
@@ -947,15 +1198,17 @@ GET    /monitors/alerts                        — list alerts (filterable by se
 PATCH  /monitors/alerts/{id}/acknowledge       — mark alert acknowledged
 ```
 
-### 11.6 Admin
+### 12.7 Admin
 
 ```
 GET    /admin/users                            — list users
 POST   /admin/users                            — create user
 DELETE /admin/users/{id}                       — delete user
+GET    /admin/enrichment-cache/stats           — cache backend, hit/miss, size, and TTL stats
+POST   /admin/enrichment-cache/invalidate      — invalidate one cached enrichment entry
 ```
 
-### 11.7 Health
+### 12.8 Health
 
 ```
 GET    /health                                 — DB + Tor connectivity check (no auth)
@@ -965,7 +1218,7 @@ GET    /debug/tor-test                         — test Tor connectivity (JWT re
 GET    /debug/search-test                      — test search engine (JWT required)
 ```
 
-### 11.8 Rate Limits
+### 12.9 Rate Limits
 
 | Endpoint | Limit |
 |---|---|
@@ -976,18 +1229,18 @@ GET    /debug/search-test                      — test search engine (JWT requi
 
 ---
 
-## 12. Configuration Reference
+## 13. Configuration Reference
 
 Copy `.env.example` to `.env`. The API reads all values at startup via `config.py`, which strips accidentally-quoted values and provides typed defaults.
 
-### 12.1 Required
+### 13.1 Required
 
 | Variable | Default | Notes |
 |---|---|---|
 | `DATABASE_URL` | — | PostgreSQL connection string. Format: `postgresql://user:pass@host:port/db` |
 | `JWT_SECRET` | — | Minimum 32-byte hex string. Auto-generated by `setup.sh`; **must be set in production**. |
 
-### 12.2 LLM Providers
+### 13.2 LLM Providers
 
 At least one LLM provider key is needed for query refinement, result filtering, and summary generation. If no key is present, the pipeline falls back to unfiltered top-100 search results and skips the summary.
 
@@ -1003,7 +1256,7 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Enables local Ollama models |
 | `LLAMA_CPP_BASE_URL` | `http://127.0.0.1:8080` | Enables llama.cpp server |
 
-### 12.3 Threat Intelligence Enrichment
+### 13.3 Threat Intelligence Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -1011,14 +1264,14 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 | `VT_API_KEY` | — | VirusTotal. Required; skipped if absent. Free tier: 4 req/min. |
 | `ABUSECH_API_KEY` | — | abuse.ch (MalwareBazaar, ThreatFox, URLhaus). Optional; improves rate limits. |
 
-### 12.4 Blockchain Enrichment
+### 13.4 Blockchain Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
 | `BLOCKCYPHER_TOKEN` | — | BlockCypher for BTC/ETH wallet lookups. Optional. |
 | `ETHERSCAN_API_KEY` | — | Etherscan for ETH wallet lookups. Optional. |
 
-### 12.5 Clearnet Scrapers
+### 13.5 Clearnet Scrapers
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -1033,41 +1286,73 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 | `RSS_FEEDS_ENABLED` | `true` | Set `false` to disable RSS feed scraping |
 | `RSS_MAX_ARTICLES` | `20` | Max RSS articles per investigation |
 
-### 12.6 DNS/WHOIS Enrichment
+### 13.6 DNS/WHOIS Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
 | `DNS_ENRICHMENT_ENABLED` | `true` | Set `false` to skip CIRCL/RDAP enrichment |
 | `SECURITYTRAILS_API_KEY` | — | Optional. Provides richer DNS history. Free tier: 50 queries/month |
 
-### 12.7 Caching and Rate Limiting
+### 13.7 Caching and Rate Limiting
 
 | Variable | Default | Notes |
 |---|---|---|
 | `REDIS_URL` | — | Redis connection string. Optional. When absent, JWT blacklist fails open and rate-limit counters are in-memory |
+| `ENRICHMENT_REDIS_URL` | — | Optional Redis override used by the enrichment cache when `REDIS_URL` is not set |
 | `DISABLE_RATE_LIMIT` | `false` | Set `true` to bypass all rate limiting (development only) |
 
-### 12.8 Tor
+Enrichment cache backend selection:
+
+1. Redis when `REDIS_URL` or `ENRICHMENT_REDIS_URL` is set and reachable.
+2. SQLite when Redis is unavailable or unset. CLI cache path defaults to `~/.voidaccess/cache.db`.
+3. In-memory dict as the last-resort fallback.
+
+Per-source TTL defaults:
+
+| Source | TTL |
+|---|---|
+| AbuseIPDB | 24h |
+| GreyNoise | 6h |
+| Hybrid Analysis | 7d |
+| HIBP | 48h |
+| crt.sh | 72h |
+| URLScan | 12h |
+| Wayback | 7d |
+| CIRCL PDNS | 24h |
+| CIRCL PSSL | 24h |
+| RDAP WHOIS | 72h |
+| MalwareBazaar | 48h |
+| ThreatFox | 24h |
+| EmailRep | 24h |
+| VirusTotal | 24h |
+
+Stats endpoint:
+
+```
+GET /admin/enrichment-cache/stats
+```
+
+### 13.8 Tor
 
 | Variable | Default | Notes |
 |---|---|---|
 | `TOR_PROXY_HOST` | `127.0.0.1` | SOCKS5 host. Docker Compose sets this to `tor` (the service name) |
 | `TOR_PROXY_PORT` | `9050` | SOCKS5 port |
 
-### 12.9 Internationalisation
+### 13.9 Internationalisation
 
 | Variable | Default | Notes |
 |---|---|---|
 | `DEEPL_API_KEY` | — | DeepL translation. Optional; falls back to Helsinki-NLP local models |
 | `I18N_LANGUAGES` | `en,ru,zh` | Comma-separated language codes for multilingual query expansion |
 
-### 12.10 Playwright
+### 13.10 Playwright
 
 | Variable | Default | Notes |
 |---|---|---|
 | `PLAYWRIGHT_ENABLED` | `true` | Enables JS-rendered `.onion` page scraping. Set `false` to save memory (~400 MB) |
 
-### 12.11 IP Reputation Enrichment
+### 13.11 IP Reputation Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -1075,29 +1360,41 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 | `GREYNOISE_API_KEY` | — | GreyNoise scanner classification. Optional; skipped if absent. IPs classified `benign_scanner` are removed from entity results before DB write |
 | `C2_FEED_CACHE_TTL` | `24` | Hours between in-memory refreshes of the Feodo Tracker and C2IntelFeeds blocklists |
 
-### 12.12 Domain Reputation Enrichment
+### 13.12 Domain Reputation Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
 | `URLSCAN_API_KEY` | — | URLScan.io scan data. Optional; public scan results are available without a key at reduced rate |
 | `URLSCAN_SUBMIT` | `false` | When `true`, VoidAccess submits new URLScan.io scans for domains with no existing result. Scans are **publicly indexed** — keep `false` for OPSEC-sensitive investigations |
 
-### 12.13 Hash Reputation Enrichment
+### 13.13 Hash Reputation Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
 | `HYBRID_ANALYSIS_API_KEY` | — | Hybrid Analysis behavioral sandbox. Optional; skipped if absent. Free tier available at hybrid-analysis.com |
 
-### 12.14 Email Reputation Enrichment
+### 13.14 Email Reputation Enrichment
 
 | Variable | Default | Notes |
 |---|---|---|
 | `HIBP_API_KEY` | — | HaveIBeenPwned breach history. Optional; skipped if absent. Paid: $3.50/month individual plan |
 | `EMAILREP_API_KEY` | — | EmailRep reputation scoring. Optional; works at reduced rate without a key |
 
+### 13.15 Pipeline Timeouts and Recovery
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VOIDACCESS_PARALLEL_SOURCES_TIMEOUT` | `300` | Seconds allowed for the parallel collection phase |
+| `VOIDACCESS_ENRICHMENT_TIMEOUT` | `120` | Seconds allowed for enrichment phases |
+| `VOIDACCESS_GRAPH_TIMEOUT` | `60` | Seconds allowed for graph building |
+| `VOIDACCESS_SUMMARY_TIMEOUT` | `90` | Seconds allowed for summary generation |
+| `VOIDACCESS_FINALIZE_TIMEOUT` | `30` | Seconds allowed for final metadata/status persistence |
+| `VOIDACCESS_INVESTIGATION_HARD_TIMEOUT_MINUTES` | `30` | Age after which a stuck processing investigation is marked failed |
+| `VOIDACCESS_SWEEP_INTERVAL_SECONDS` | `300` | How often the stuck-investigation sweep runs |
+
 ---
 
-## 13. Known Limitations
+## 14. Known Limitations
 
 ### CLI Requires Local Tor
 
@@ -1122,10 +1419,6 @@ Free-tier models on OpenRouter enforce per-minute rate limits. The pipeline has 
 ### JWT Blacklist Fails Open When Redis is Down
 
 `POST /auth/logout` writes revoked tokens to Redis. If Redis is unavailable, the logout call silently succeeds but the token remains valid until its JWT expiry time. This is the intended fallback to avoid blocking all auth on a Redis outage, but it means logout is best-effort without Redis.
-
-### In-Process Cache Reset on Container Restart
-
-`_infra_cluster_cache` (infrastructure clusters) and `_sources_used_cache` (sources panel data) are Python dicts in the FastAPI process. They are lost on container restart or worker reload. After a restart, completed investigations will return empty `infrastructure_clusters` and `sources_used` for investigations run before the restart.
 
 ### Temporal Analysis Uses Scrape Time, Not Content Time
 

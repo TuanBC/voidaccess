@@ -436,9 +436,9 @@ class RSSFeedScraper:
                     if url:
                         articles.append({
                             "url": url,
-                            "title": (title_el.text or "") if title_el else "",
-                            "summary": (summary_el.text or "") if summary_el else "",
-                            "published": (pub_el.text or "") if pub_el else "",
+                            "title": (title_el.text or "") if title_el is not None else "",
+                            "summary": (summary_el.text or "") if summary_el is not None else "",
+                            "published": (pub_el.text or "") if pub_el is not None else "",
                         })
             else:
                 channel = root.find("channel") or root
@@ -451,11 +451,11 @@ class RSSFeedScraper:
                     if url:
                         articles.append({
                             "url": url,
-                            "title": (title_el.text or "") if title_el else "",
+                            "title": (title_el.text or "") if title_el is not None else "",
                             "summary": self._strip_html(
-                                (desc_el.text or "") if desc_el else ""
+                                (desc_el.text or "") if desc_el is not None else ""
                             ),
-                            "published": (pub_el.text or "") if pub_el else "",
+                            "published": (pub_el.text or "") if pub_el is not None else "",
                         })
 
         except ET.ParseError as e:

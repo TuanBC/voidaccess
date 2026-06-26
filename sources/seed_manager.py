@@ -19,9 +19,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiohttp
 import aiohttp_socks
@@ -216,13 +217,25 @@ class SeedManager:
     def add_discovered_seed(
         self,
         url: str,
-        name: str,
-        tags: list[str],
+        name: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         category: str = "discovered",
+        source_url: Optional[str] = None,
+        investigation_id: Optional[str] = None,
     ) -> bool:
         """
         Add a newly discovered onion URL to seeds.
-        Called by the pipeline when new onions are found.
+        Called by the pipeline when new onions are found in scraped content.
+
+        No liveness check is performed here — discovery is fast, validation
+        is async (handled by the weekly validate_seeds() job). Newly added
+        seeds start with status="discovered" and are not promoted to
+        "active" until validate_seeds() confirms reachability.
+
+        Optional tracking kwargs:
+          source_url       — the page the .onion was found on (provenance)
+          investigation_id — the investigation that surfaced it (provenance)
+
         Returns True if added, False if duplicate or blocked.
         """
         if not self._loaded:
@@ -236,21 +249,73 @@ class SeedManager:
         if blocked:
             return False
 
-        new_seed = {
+        # Derive a name from hostname when caller did not supply one.
+        if not name:
+            try:
+                from urllib.parse import urlparse
+                host = (urlparse(url).hostname or "").lower()
+                if host:
+                    name = host.split(".")[0][:32] or "discovered-onion"
+                else:
+                    name = "discovered-onion"
+            except Exception:
+                name = "discovered-onion"
+
+        new_seed: dict = {
             "name": name,
             "url": url,
-            "tags": list(tags),
+            "tags": list(tags or []),
             "category": category,
             "category_tags": [category],
             "status": "discovered",
             "added": datetime.now(timezone.utc).date().isoformat(),
+            "added_at": datetime.now(timezone.utc).isoformat(),
         }
+        if source_url:
+            new_seed["source_url"] = source_url
+        if investigation_id:
+            new_seed["investigation_id"] = investigation_id
 
         self._seeds.append(new_seed)
         self._save()
 
         logger.info("Added new seed: %s", url[:50])
         return True
+
+    async def add_discovered_seed_async(
+        self,
+        url: str,
+        name: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        category: str = "discovered",
+        source_url: Optional[str] = None,
+        investigation_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Async wrapper around add_discovered_seed() — runs the (sync) JSON
+        write off the event loop so callers can `await` it without
+        stalling the asyncio loop during a heavy scrape fan-out.
+
+        Behavior is identical to the sync method; failures are swallowed
+        and logged because seed discovery is fire-and-forget.
+        """
+        try:
+            return await asyncio.to_thread(
+                self.add_discovered_seed,
+                url,
+                name,
+                tags,
+                category,
+                source_url,
+                investigation_id,
+            )
+        except Exception as exc:
+            logger.debug(
+                "add_discovered_seed_async failed (non-fatal) for %s: %s",
+                url[:50] if url else "",
+                exc,
+            )
+            return False
 
     def summary(self) -> dict:
         """Return counts grouped by category and status."""
@@ -282,6 +347,65 @@ class SeedManager:
         if not self._loaded:
             self.load()
         return [dict(s) for s in self._seeds]
+
+    def list_discovered_seeds(
+        self,
+        only_pending: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Return auto-discovered seeds (category == "discovered").
+
+        Args:
+            only_pending: when True, restrict to seeds still awaiting
+                validation (status == "discovered").  Use this for the
+                admin endpoint that surfaces work-in-progress.
+            limit: optional cap on result count (preserves insertion order).
+        """
+        if not self._loaded:
+            self.load()
+
+        results: list[dict] = []
+        for s in self._seeds:
+            if s.get("category") != "discovered":
+                continue
+            if only_pending and s.get("status") != "discovered":
+                continue
+            results.append(dict(s))
+            if limit is not None and len(results) >= limit:
+                break
+        return results
+
+    def count_by_type(self) -> dict:
+        """
+        Return permanent-vs-discovered breakdown used by `voidaccess status --seeds`.
+        """
+        if not self._loaded:
+            self.load()
+
+        permanent = 0
+        discovered = 0
+        discovered_pending = 0
+        discovered_validated = 0
+        for s in self._seeds:
+            if s.get("category") == "discovered":
+                discovered += 1
+                if s.get("status") == "discovered":
+                    discovered_pending += 1
+                elif s.get("status") in ("active", "inactive"):
+                    discovered_validated += 1
+            else:
+                permanent += 1
+        return {
+            "permanent": permanent,
+            "discovered_total": discovered,
+            "discovered_pending": discovered_pending,
+            "discovered_validated": discovered_validated,
+        }
+
+    def list_pending_validation(self) -> list[dict]:
+        """Convenience wrapper — discovered seeds still awaiting validate_seeds()."""
+        return self.list_discovered_seeds(only_pending=True)
 
     def _load_raw(self) -> dict:
         """Load the on-disk file structure (preserving category metadata)."""
@@ -342,19 +466,90 @@ class SeedManager:
                 existing_urls = {s["url"] for s in bucket.get("seeds", [])}
                 for s in discovered:
                     if s["url"] not in existing_urls:
-                        bucket["seeds"].append({
+                        entry: dict = {
                             "name": s["name"],
                             "url": s["url"],
                             "tags": s["tags"],
                             "status": s["status"],
                             "added": s["added"],
-                        })
+                        }
+                        # Persist provenance metadata when present so admins can
+                        # see where each discovered seed came from.
+                        if s.get("source_url"):
+                            entry["source_url"] = s["source_url"]
+                        if s.get("investigation_id"):
+                            entry["investigation_id"] = s["investigation_id"]
+                        if s.get("added_at"):
+                            entry["added_at"] = s["added_at"]
+                        bucket["seeds"].append(entry)
                         existing_urls.add(s["url"])
 
             data["last_updated"] = datetime.now(timezone.utc).date().isoformat()
             SEED_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as e:
             logger.error("Failed to save seeds: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+# Match v3 onion addresses (56 chars) — current standard.
+# Match legacy v2 onion addresses (16 chars) — mostly dead since Tor disabled v2
+# in Oct 2021 but still useful for archive/forensic content.
+_V3_PATTERN = re.compile(r"\b([a-z2-7]{56}\.onion)\b", re.IGNORECASE)
+_V2_PATTERN = re.compile(r"\b([a-z2-7]{16}\.onion)\b", re.IGNORECASE)
+
+# Known example/placeholder onion addresses used in tutorials and the Tor
+# project docs.  These appear all over the clearnet and are not real
+# intelligence targets — filter them out so they don't pollute the seed pool.
+_EXAMPLE_PATTERNS = (
+    "facebookwkhpilnemx",   # Facebook's official .onion (tutorial example)
+    "expyuzz4wqqyqhjn",     # Tor Project example in docs
+)
+
+# Cap per-page extraction so a single bloated page can't dump hundreds of
+# .onion URLs into the seed pool.  Combined with the per-investigation cap
+# (enforced by the caller) this bounds memory and write I/O.
+EXTRACT_MAX_PER_PAGE = 20
+
+
+def extract_onion_urls_from_content(
+    content: str,
+    max_per_page: int = EXTRACT_MAX_PER_PAGE,
+    extra_examples: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """
+    Extract .onion hostnames from arbitrary page content (HTML, plain text,
+    forum posts, paste dumps).
+
+    Returns a deduplicated, lowercased list of .onion hostnames capped at
+    ``max_per_page``.  Known example/placeholder addresses are filtered
+    out automatically; pass ``extra_examples`` to extend the filter.
+
+    No URL scheme is prepended — callers compose ``http://{hostname}`` when
+    handing the result to the seed manager.  This keeps the extractor
+    independent of HTTP scheme decisions.
+    """
+    if not content:
+        return []
+
+    found: set[str] = set()
+    for match in _V3_PATTERN.finditer(content):
+        found.add(match.group(1).lower())
+    for match in _V2_PATTERN.finditer(content):
+        found.add(match.group(1).lower())
+
+    examples = _EXAMPLE_PATTERNS
+    if extra_examples:
+        examples = examples + tuple(extra_examples)
+
+    filtered = [
+        host for host in found
+        if not any(p in host for p in examples)
+    ]
+
+    return filtered[: max(0, int(max_per_page))]
 
 
 # ---------------------------------------------------------------------------

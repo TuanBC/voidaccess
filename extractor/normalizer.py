@@ -34,14 +34,58 @@ logger = logging.getLogger(__name__)
 TYPE_PRIORITY = {
     "CVE": 1,
     "MITRE_TECHNIQUE": 1,
+    "MITRE_TACTIC": 1,
     "FILE_HASH_SHA256": 1,
     "FILE_HASH_SHA1": 1,
     "FILE_HASH_MD5": 1,
     "IP_ADDRESS": 1,
+    "IPV6_ADDRESS": 1,
+    "MAC_ADDRESS": 1,
+    "IPFS_CID": 1,
+    "EXPLOIT_DB_ID": 1,
+    "YARA_RULE": 2,
+    "NUCLEI_TEMPLATE": 2,
     "ONION_URL": 1,
+    # Credential / token IOCs — high specificity, high value, priority 1.
+    "AWS_ACCESS_KEY": 1,
+    "AWS_SECRET_KEY": 1,
+    "GITHUB_TOKEN": 1,
+    "SLACK_TOKEN": 1,
+    "DISCORD_TOKEN": 1,
+    "JWT_TOKEN": 1,
+    "GOOGLE_API_KEY": 1,
+    "STRIPE_KEY": 1,
+    "STEALER_LOG_ENTRY": 1,
+    # Messaging / identity handle IOCs — high specificity shapes.  XMPP_JID
+    # at priority 1 means an "xmpp: user@host" address wins over a plain
+    # EMAIL_ADDRESS (priority 4) when the same value would qualify as both.
+    "TELEGRAM_HANDLE": 1,
+    "DISCORD_HANDLE": 1,
+    "XMPP_JID": 1,
+    "TOX_ID": 1,
+    "SESSION_ID": 1,
+    "MATRIX_HANDLE": 1,
     "BITCOIN_ADDRESS": 2,
     "MONERO_ADDRESS": 2,
     "ETH_ADDRESS": 2,
+    "ETHEREUM_ADDRESS": 2,
+    "LITECOIN_ADDRESS": 2,
+    "ZCASH_ADDRESS": 2,
+    "DOGECOIN_ADDRESS": 2,
+    "XRP_ADDRESS": 2,
+    "SOLANA_ADDRESS": 2,
+    "TRON_ADDRESS": 2,
+    "BITCOIN_CASH_ADDRESS": 2,
+    "DASH_ADDRESS": 2,
+    "ENS_DOMAIN": 2,
+    "API_KEY": 2,  # generic — slightly broader pattern, lower priority than vendor-specific
+    # Context-dependent messaging handles — slightly lower priority than the
+    # shape-specific ones above because they require a context keyword.
+    "WIRE_HANDLE": 2,
+    "ICQ_NUMBER": 2,
+    "WICKR_ID": 2,
+    "COMBO_LIST_ENTRY": 1,
+    "CRYPTO_SEED_PHRASE": 1,
     "RANSOMWARE_GROUP": 3,
     "THREAT_ACTOR": 3,
     "MALWARE_FAMILY": 3,
@@ -66,11 +110,55 @@ TIEBREAK_ORDER = [
     "MITRE_TECHNIQUE",
     "IP_ADDRESS",
     "ONION_URL",
+    # Credentials — vendor-specific wins over generic in a tie.
+    "AWS_ACCESS_KEY",
+    "AWS_SECRET_KEY",
+    "GITHUB_TOKEN",
+    "SLACK_TOKEN",
+    "DISCORD_TOKEN",
+    "JWT_TOKEN",
+    "GOOGLE_API_KEY",
+    "STRIPE_KEY",
+    "STEALER_LOG_ENTRY",
+    "API_KEY",
+    # Messaging / identity handles — placed next to credentials in the
+    # tiebreak ladder so shape-specific messaging IOCs outrank EMAIL.
+    "TELEGRAM_HANDLE",
+    "DISCORD_HANDLE",
+    "XMPP_JID",
+    "TOX_ID",
+    "SESSION_ID",
+    "MATRIX_HANDLE",
+    "WIRE_HANDLE",
+    "ICQ_NUMBER",
+    "WICKR_ID",
+    # Network / forensic identifiers (Phase 2 — final subphase).  All
+    # placed near the high-specificity IOCs at the top of the tiebreak
+    # ladder so they win against generic types when the same value
+    # would qualify as more than one entity.
+    "IPV6_ADDRESS",
+    "MAC_ADDRESS",
+    "IPFS_CID",
+    "EXPLOIT_DB_ID",
+    "YARA_RULE",
+    "NUCLEI_TEMPLATE",
+    "MITRE_TACTIC",
+    "COMBO_LIST_ENTRY",
+    "CRYPTO_SEED_PHRASE",
     "EMAIL_ADDRESS",
     "PGP_KEY_BLOCK",
     "BITCOIN_ADDRESS",
+    "ETHEREUM_ADDRESS",
     "MONERO_ADDRESS",
-    "ETH_ADDRESS",
+    "LITECOIN_ADDRESS",
+    "ZCASH_ADDRESS",
+    "DOGECOIN_ADDRESS",
+    "XRP_ADDRESS",
+    "SOLANA_ADDRESS",
+    "TRON_ADDRESS",
+    "BITCOIN_CASH_ADDRESS",
+    "DASH_ADDRESS",
+    "ENS_DOMAIN",
     "DOMAIN",
     "ORGANIZATION_NAME",
     "PERSON_NAME",
@@ -161,6 +249,147 @@ def _validate_onion_url(value: str) -> bool:
     return bool(_ONION_PATTERN.match(value))
 
 
+def _validate_crypto_wallet(entity_type: str, value: str) -> bool:
+    """
+    Defensive shape check for the new cryptocurrency wallet types.
+
+    The regex extractors already enforce these shapes, but this is a
+    second-line check in the normalizer so a malformed value can never
+    slip into the DB even if a future refactor weakens the regex.
+    """
+    if not value:
+        return False
+
+    if entity_type == "LITECOIN_ADDRESS":
+        # L or M prefix, base58, 27-34 chars total
+        return bool(re.fullmatch(r"[LM][a-km-zA-HJ-NP-Z1-9]{26,33}", value))
+
+    if entity_type == "ZCASH_ADDRESS":
+        # Transparent (t1/t3 + 33 base58) or shielded (zs1 + 74-78 [a-z0-9])
+        return bool(
+            re.fullmatch(r"t[13][a-km-zA-HJ-NP-Z1-9]{33}", value)
+            or re.fullmatch(r"zs1[a-z0-9]{74,78}", value)
+        )
+
+    if entity_type == "DOGECOIN_ADDRESS":
+        # D prefix, standard base58 (1-9 + A-Z excl I/O + a-z excl l), 26-34 chars total
+        return bool(re.fullmatch(r"D[1-9A-HJ-NP-Za-km-z]{24,33}", value))
+
+    if entity_type == "XRP_ADDRESS":
+        # r prefix, 25-35 alphanumeric
+        return bool(re.fullmatch(r"r[0-9a-zA-Z]{24,34}", value))
+
+    if entity_type == "SOLANA_ADDRESS":
+        # base58, 32-44 chars, no prefix
+        return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", value))
+
+    if entity_type == "TRON_ADDRESS":
+        # T prefix, base58 (no 0/O/I/l), 34 chars total
+        return bool(re.fullmatch(r"T[A-HJ-NP-Za-km-z1-9]{33}", value))
+
+    if entity_type == "BITCOIN_CASH_ADDRESS":
+        # cashaddr: bitcoincash:q... or bitcoincash:p... with 41-111 chars payload
+        if not value.startswith("bitcoincash:"):
+            return False
+        payload = value[len("bitcoincash:"):]
+        if len(payload) < 42 or len(payload) > 112:
+            return False
+        if payload[0] not in ("q", "p"):
+            return False
+        return bool(re.fullmatch(r"[a-z0-9]+", payload))
+
+    if entity_type == "DASH_ADDRESS":
+        # X prefix, base58 (excludes 0/O), 34 chars total
+        return bool(re.fullmatch(r"X[1-9A-HJ-NP-Za-km-z]{33}", value))
+
+    if entity_type == "ENS_DOMAIN":
+        # <label>.eth, label 3-63 chars, alphanumeric + hyphen (no edge hyphens)
+        if not value.lower().endswith(".eth"):
+            return False
+        label = value[:-4]
+        if len(label) < 3 or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        return bool(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9\-]{1,61}[a-zA-Z0-9]", label))
+
+    # Unknown crypto entity type — let it through (validator should be added).
+    return True
+
+
+def _validate_network_forensic(entity_type: str, value: str) -> bool:
+    """
+    Defensive shape check for the network / forensic identifier types
+    added per Phase 2 (final subphase).
+
+    The regex extractors already enforce these shapes via regex +
+    validators, but this is a second line of defence so a malformed
+    value can never reach the DB even if a future refactor weakens the
+    regex.
+
+    Returns True if the value passes the shape check, False otherwise.
+    """
+    if not value:
+        return False
+
+    if entity_type == "IPV6_ADDRESS":
+        # Defer to the regex_patterns helper (handles all standard
+        # forms plus the private/loopback filter).
+        try:
+            from extractor.regex_patterns import _is_valid_ipv6
+            return _is_valid_ipv6(value)
+        except Exception:
+            return False
+
+    if entity_type == "MAC_ADDRESS":
+        # Canonical form is AA:BB:CC:DD:EE:FF (17 chars, 5 colons).
+        return bool(re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", value))
+
+    if entity_type == "IPFS_CID":
+        # CIDv0 (Qm + 44 base58) or CIDv1 (bafy + 55-60 base32)
+        return bool(
+            re.fullmatch(r"Qm[1-9A-HJ-NP-Za-km-z]{44}", value)
+            or re.fullmatch(r"bafy[a-z2-7]{55,60}", value)
+        )
+
+    if entity_type == "YARA_RULE":
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,127}", value))
+
+    if entity_type == "MITRE_TACTIC":
+        if not re.fullmatch(r"TA\d{4}", value):
+            return False
+        n = int(value[2:])
+        return 1 <= n <= 43
+
+    if entity_type == "EXPLOIT_DB_ID":
+        return bool(re.fullmatch(r"[0-9]{4,6}", value))
+
+    if entity_type == "NUCLEI_TEMPLATE":
+        return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+){2,6}", value))
+
+    if entity_type == "COMBO_LIST_ENTRY":
+        # The canonical value is the email side of an email:password
+        # line.  It must look like an email and must NOT contain the
+        # password-substring indicators (a downstream blocklist check
+        # catches that — this is the shape check).
+        return "@" in value and "." in value
+
+    if entity_type == "CRYPTO_SEED_PHRASE":
+        # The canonical value is one of two fixed marker strings.  If
+        # a future refactor accidentally leaks an actual seed phrase
+        # through the normalizer, we reject anything that is not one
+        # of the two known marker strings.
+        return value in (
+            "SEED_PHRASE_DETECTED_12_WORDS",
+            "SEED_PHRASE_DETECTED_24_WORDS",
+        )
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+
+
 # ---------------------------------------------------------------------------
 # Confidence scores by extraction source (inferred from entity_type)
 # ---------------------------------------------------------------------------
@@ -169,6 +398,15 @@ _REGEX_TYPES: frozenset[str] = frozenset({
     "BITCOIN_ADDRESS",
     "ETHEREUM_ADDRESS",
     "MONERO_ADDRESS",
+    "LITECOIN_ADDRESS",
+    "ZCASH_ADDRESS",
+    "DOGECOIN_ADDRESS",
+    "XRP_ADDRESS",
+    "SOLANA_ADDRESS",
+    "TRON_ADDRESS",
+    "BITCOIN_CASH_ADDRESS",
+    "DASH_ADDRESS",
+    "ENS_DOMAIN",
     "ONION_URL",
     "EMAIL_ADDRESS",
     "PGP_KEY_BLOCK",
@@ -180,7 +418,127 @@ _REGEX_TYPES: frozenset[str] = frozenset({
     "PHONE_NUMBER",
     "PASTE_URL",
     "MITRE_TECHNIQUE",
+    # Credential / token types — all bypass blocklist and use regex confidence.
+    "AWS_ACCESS_KEY",
+    "AWS_SECRET_KEY",
+    "GITHUB_TOKEN",
+    "SLACK_TOKEN",
+    "DISCORD_TOKEN",
+    "JWT_TOKEN",
+    "GOOGLE_API_KEY",
+    "STRIPE_KEY",
+    "STEALER_LOG_ENTRY",
+    "API_KEY",
+    # Messaging / identity handle types — also bypass blocklist (their
+    # shapes are precise enough to require a context-keyword check in the
+    # regex extractor; the blocklist would otherwise false-positive on
+    # common messaging usernames).
+    "TELEGRAM_HANDLE",
+    "DISCORD_HANDLE",
+    "XMPP_JID",
+    "TOX_ID",
+    "SESSION_ID",
+    "MATRIX_HANDLE",
+    "WIRE_HANDLE",
+    "ICQ_NUMBER",
+    "WICKR_ID",
+    # Network / forensic identifier types (Phase 2 — final subphase).
+    # Bypass the blocklist (their shapes are precise / context-checked)
+    # and use the per-type confidence map below.
+    "IPV6_ADDRESS",
+    "MAC_ADDRESS",
+    "IPFS_CID",
+    "YARA_RULE",
+    "MITRE_TACTIC",
+    "EXPLOIT_DB_ID",
+    "NUCLEI_TEMPLATE",
+    "COMBO_LIST_ENTRY",
+    "CRYPTO_SEED_PHRASE",
 })
+
+# Per-type confidence overrides for the newer coin regexes.  The base
+# _REGEX_TYPES default of 1.0 is reserved for the three original "high
+# confidence" patterns (BTC/ETH/XMR).  The LTC/ZEC/DOGE/TRX/BCH/DASH
+# patterns are precise (clear prefix + tight charset) and get 0.95; the
+# broader XRP/SOL patterns (single-char prefix, no prefix respectively)
+# get 0.85 because they rely on the crypto-context window filter; ENS
+# sits in between at 0.90 (regex is tight but the value is a domain, not
+# a wallet — slight additional ambiguity).
+#
+# Credential confidences per the design brief:
+#   AWS_ACCESS_KEY  = 1.0   (AKIA + 16 alnum is unambiguous)
+#   AWS_SECRET_KEY  = 0.95  (context-dependent, 40-char base64)
+#   GITHUB_TOKEN    = 1.0   (gh[posaur]_ / github_pat_ are vendor-prefixed)
+#   SLACK_TOKEN     = 1.0   (xox[bpas]- prefix)
+#   DISCORD_TOKEN   = 0.95  (24.6.27 base64url — could collide w/ random)
+#   JWT_TOKEN       = 0.85  (broader pattern, eyJ anchor only)
+#   GOOGLE_API_KEY  = 1.0   (AIza + 35 chars is vendor-prefixed)
+#   STRIPE_KEY      = 1.0   ([psr]k_(live|test)_ is vendor-prefixed)
+#   STEALER_LOG_ENTRY = 0.90 (URL/LOGIN/PASSWORD three-line format)
+#   API_KEY         = 0.80  (broad label + entropy; widest net)
+_REGEX_TYPE_CONFIDENCE: dict[str, float] = {
+    "BITCOIN_ADDRESS": 1.0,
+    "ETHEREUM_ADDRESS": 1.0,
+    "MONERO_ADDRESS": 1.0,
+    "LITECOIN_ADDRESS": 0.95,
+    "ZCASH_ADDRESS": 0.95,
+    "DOGECOIN_ADDRESS": 0.95,
+    "XRP_ADDRESS": 0.85,
+    "SOLANA_ADDRESS": 0.85,
+    "TRON_ADDRESS": 0.95,
+    "BITCOIN_CASH_ADDRESS": 0.95,
+    "DASH_ADDRESS": 0.95,
+    "ENS_DOMAIN": 0.90,
+    # Credential / token confidences
+    "AWS_ACCESS_KEY": 1.0,
+    "AWS_SECRET_KEY": 0.95,
+    "GITHUB_TOKEN": 1.0,
+    "SLACK_TOKEN": 1.0,
+    "DISCORD_TOKEN": 0.95,
+    "JWT_TOKEN": 0.85,
+    "GOOGLE_API_KEY": 1.0,
+    "STRIPE_KEY": 1.0,
+    "STEALER_LOG_ENTRY": 0.90,
+    "API_KEY": 0.80,
+    # Messaging / identity handle confidences
+    # Shape-specific formats (TOX_ID, SESSION_ID, MATRIX_HANDLE) are
+    # unambiguous → 1.0 / 0.95.  Context-dependent ones (TELEGRAM,
+    # DISCORD legacy, XMPP) use 0.85-0.90.  New-format @username,
+    # Wire, Wickr, ICQ all require a context keyword → 0.85.
+    "TELEGRAM_HANDLE": 0.90,
+    "DISCORD_HANDLE": 0.85,
+    "XMPP_JID": 0.85,
+    "TOX_ID": 1.0,
+    "SESSION_ID": 1.0,
+    "MATRIX_HANDLE": 0.95,
+    "WIRE_HANDLE": 0.85,
+    "ICQ_NUMBER": 0.85,
+    "WICKR_ID": 0.85,
+    # Network / forensic identifier confidences (Phase 2 — final subphase)
+    #   IPV6_ADDRESS     1.0  (full form is unambiguous; validator filters
+    #                         private/loopback/ULA)
+    #   MAC_ADDRESS      0.95 (3 input shapes; canonical uppercase colon)
+    #   IPFS_CID         0.95 (CIDv0/CIDv1 are vendor-specific prefixes)
+    #   YARA_RULE        0.90 (name + YARA-context check)
+    #   MITRE_TACTIC     1.0  (TA0001-TA0043 is a small, fixed namespace)
+    #   EXPLOIT_DB_ID    0.95 (4-6 digit ID; either EDB-ID: or URL form)
+    #   NUCLEI_TEMPLATE  0.85 (broad dash-segment pattern; nuclei-context
+    #                         window is the primary filter)
+    #   COMBO_LIST_ENTRY 0.85 (3+ line threshold; email side only,
+    #                         password never stored)
+    #   CRYPTO_SEED_PHRASE 0.90 (BIP39 wordlist; canonical emit is a
+    #                           marker, not the actual phrase)
+    "IPV6_ADDRESS": 1.0,
+    "MAC_ADDRESS": 0.95,
+    "IPFS_CID": 0.95,
+    "YARA_RULE": 0.90,
+    "MITRE_TACTIC": 1.0,
+    "EXPLOIT_DB_ID": 0.95,
+    "NUCLEI_TEMPLATE": 0.85,
+    "COMBO_LIST_ENTRY": 0.85,
+    "CRYPTO_SEED_PHRASE": 0.90,
+    # Everything else in _REGEX_TYPES stays at the default 1.0
+}
 
 _NER_TYPES: frozenset[str] = frozenset({
     "THREAT_ACTOR_HANDLE",
@@ -190,12 +548,24 @@ _NER_TYPES: frozenset[str] = frozenset({
 })
 
 
+_ELEVATED_CONFIDENCE: dict[str, float] = {
+    "DATE": 0.82,
+    "DOMAIN": 0.82,
+    "LOCATION": 0.82,
+    "PERSON_NAME": 0.82,
+}
+
+
 def _confidence_for(entity_type: str) -> float:
+    # Per-type override takes precedence — covers the newer coins whose
+    # patterns are precise but slightly broader than BTC/ETH/XMR.
+    if entity_type in _REGEX_TYPE_CONFIDENCE:
+        return _REGEX_TYPE_CONFIDENCE[entity_type]
     if entity_type in _REGEX_TYPES:
         return 1.0
     if entity_type in _NER_TYPES:
         return 0.85
-    return 0.75
+    return _ELEVATED_CONFIDENCE.get(entity_type, 0.75)
 
 
 def _extraction_method_for(entity_type: str) -> str:
@@ -273,12 +643,59 @@ ENTITY_MIN_LENGTH: dict[str, int] = {
     "BITCOIN_ADDRESS": 10,
     "ETHEREUM_ADDRESS": 10,
     "MONERO_ADDRESS": 10,
+    "LITECOIN_ADDRESS": 10,
+    "ZCASH_ADDRESS": 10,
+    "DOGECOIN_ADDRESS": 10,
+    "XRP_ADDRESS": 10,
+    "SOLANA_ADDRESS": 10,
+    "TRON_ADDRESS": 10,
+    "BITCOIN_CASH_ADDRESS": 16,  # includes the "bitcoincash:" prefix
+    "DASH_ADDRESS": 10,
+    "ENS_DOMAIN": 5,  # "<a>.eth" minimum
     "ONION_URL": 16,
     "EMAIL_ADDRESS": 6,
     "CVE_NUMBER": 9,
     "IP_ADDRESS": 7,
     "PGP_KEY_BLOCK": 8,
     "PASTE_URL": 10,
+    # Credential / token min lengths — the regexes already enforce
+    # the structural shape, these floors only matter as a defence in
+    # depth against a future refactor that loosens the regex.
+    "AWS_ACCESS_KEY": 20,    # AKIA + 16
+    "AWS_SECRET_KEY": 40,    # base64 40
+    "GITHUB_TOKEN": 10,      # prefix + payload
+    "SLACK_TOKEN": 20,       # xox[bpas]- + payload
+    "DISCORD_TOKEN": 50,     # 24+1+6+1+27 = 59, but at least 50
+    "JWT_TOKEN": 20,         # eyJ... + 2 segments
+    "GOOGLE_API_KEY": 39,    # AIza + 35
+    "STRIPE_KEY": 30,        # sk_live_ + 24
+    "STEALER_LOG_ENTRY": 8,  # the URL string itself
+    "API_KEY": 16,
+    # Messaging / identity handle min lengths — these are defence-in-depth
+    # floors; the regexes already enforce the shape (e.g. Telegram username
+    # is 5-32 chars, Tox ID is exactly 76 hex chars).
+    "TELEGRAM_HANDLE": 5,    # "lockb" (5 chars) is the shortest valid Telegram username
+    "DISCORD_HANDLE": 3,     # "ab#0" technically too short for discriminator; minimum realistic: "ab#0000" (6)
+    "XMPP_JID": 6,           # a@b.cd
+    "TOX_ID": 76,            # exactly 76 hex chars
+    "SESSION_ID": 66,        # 66 hex chars (05 + 64)
+    "MATRIX_HANDLE": 5,      # @a:b.cd
+    "WIRE_HANDLE": 2,        # "ab"
+    "ICQ_NUMBER": 5,         # 5-digit UIN
+    "WICKR_ID": 1,           # single char (rare but valid)
+    # Network / forensic identifier min lengths (Phase 2 — final subphase).
+    # These are defence-in-depth floors; the regexes already enforce the
+    # structural shape, but the floors stop a future refactor from
+    # silently allowing a too-short value through.
+    "IPV6_ADDRESS": 2,         # "::" is the shortest valid form
+    "MAC_ADDRESS": 17,         # "AA:BB:CC:DD:EE:FF" (17 chars including colons)
+    "IPFS_CID": 46,            # Qm + 44 base58 (46 chars)
+    "YARA_RULE": 3,            # 3-char minimum identifier per regex
+    "MITRE_TACTIC": 6,         # "TA0001" — 6 chars
+    "EXPLOIT_DB_ID": 4,        # 4-digit minimum
+    "NUCLEI_TEMPLATE": 5,      # "a-b-c" minimum (3 segments)
+    "COMBO_LIST_ENTRY": 5,     # "a@b.c" minimum
+    "CRYPTO_SEED_PHRASE": 24,  # "SEED_PHRASE_DETECTED_12_WORDS"
 }
 
 
@@ -317,6 +734,28 @@ def is_blocked_entity(entity_type: str, entity_value: str) -> bool:
     return False
 
 
+_ORG_NOISE_RE = re.compile(
+    r'\b(paid|bought|sold|hacked|leaked)\b'
+    r'|\b(attempt|operations|disrupted)\b'
+    r'|\b(http|onion|tor|socks)\b'
+    r'|\b(zero.log|tor.native)\b'
+    r'|^\d'
+    r'|[<>{}\[\]|\\]',
+    re.IGNORECASE,
+)
+
+
+def _is_valid_org_name(value: str) -> bool:
+    v = value.strip()
+    if len(v) < 3 or len(v) > 60:
+        return False
+    if len(v.split()) > 5:
+        return False
+    if _ORG_NOISE_RE.search(v):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # NormalizedEntity dataclass
 # ---------------------------------------------------------------------------
@@ -331,6 +770,16 @@ class NormalizedEntity:
     page_id: Optional[uuid.UUID]
     context_snippet: str = field(default="")
     extraction_method: str = field(default="")
+
+    @property
+    def canonical_value(self) -> str:
+        return self.value
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +886,116 @@ def canonicalize_entity_value(entity_type: str, value: str) -> str:
         v = re.sub(r"[^\w]", "", v)
         return v
 
-    elif entity_type in ("WALLET", "BITCOIN_ADDRESS", "ETHEREUM_ADDRESS", "MONERO_ADDRESS"):
+    elif entity_type in (
+        "WALLET",
+        "BITCOIN_ADDRESS",
+        "ETHEREUM_ADDRESS",
+        "MONERO_ADDRESS",
+        "LITECOIN_ADDRESS",
+        "ZCASH_ADDRESS",
+        "DOGECOIN_ADDRESS",
+        "XRP_ADDRESS",
+        "SOLANA_ADDRESS",
+        "TRON_ADDRESS",
+        "BITCOIN_CASH_ADDRESS",
+        "DASH_ADDRESS",
+    ):
         if v.startswith("0x"):
             return v.lower()
         if v.startswith("4") and len(v) in (95, 106):
             return v.lower()
+        if v.startswith("bitcoincash:"):
+            # Lowercase the BCH prefix; cashaddr payload is already lowercase.
+            return v.lower()
+        if v.startswith("zs1"):
+            return v.lower()
+        # Solana / XRP / LTC / DOGE / TRX / DASH / ZEC: case-preserving
+        # canonical forms (base58 alphabet is mixed case but addresses are
+        # conventionally written in their original case to preserve the
+        # implicit checksum).  We only normalize outer whitespace.
         return v.strip()
+
+    elif entity_type == "ENS_DOMAIN":
+        return v.lower().strip()
+
+    elif entity_type in (
+        # Credential / token canonicalisation — strip whitespace,
+        # preserve original case (secrets are case-sensitive).  AWS
+        # access keys are upper-case by format but we don't enforce
+        # that here (the regex enforces it upstream).
+        "AWS_ACCESS_KEY",
+        "AWS_SECRET_KEY",
+        "GITHUB_TOKEN",
+        "SLACK_TOKEN",
+        "DISCORD_TOKEN",
+        "JWT_TOKEN",
+        "GOOGLE_API_KEY",
+        "STRIPE_KEY",
+        "STEALER_LOG_ENTRY",
+        "API_KEY",
+    ):
+        return v.strip()
+
+    elif entity_type in (
+        # Network / forensic identifier canonicalisation.  Most of these
+        # are case-insensitive (IPv6 hex, MAC upper-cased, IPFS base58
+        # / base32 which use a specific charset, MITRE tactic IDs are
+        # uppercase, EDB-IDs numeric, YARA rule names case-preserved).
+        # IPFS CIDs are kept as-is (base58/base32 charsets don't
+        # benefit from case folding; the regex enforces the charset).
+        # COMBO_LIST_ENTRY is the email side of a credential combo
+        # block — same canonicalisation as EMAIL_ADDRESS.
+        # CRYPTO_SEED_PHRASE is a marker string already; preserved.
+        "IPV6_ADDRESS",
+        "MAC_ADDRESS",
+        "IPFS_CID",
+        "YARA_RULE",
+        "MITRE_TACTIC",
+        "EXPLOIT_DB_ID",
+        "NUCLEI_TEMPLATE",
+        "COMBO_LIST_ENTRY",
+        "CRYPTO_SEED_PHRASE",
+    ):
+        if entity_type == "MITRE_TACTIC":
+            return v.upper().strip()
+        if entity_type == "MAC_ADDRESS":
+            # Canonicalise to uppercase colon form via the regex
+            # helper (the extractor already does this on extraction
+            # but the normaliser re-applies as defence in depth).
+            from extractor.regex_patterns import _normalize_mac_address
+            return _normalize_mac_address(v)
+        if entity_type == "IPV6_ADDRESS":
+            # Lowercase the hex (RFC 5952 recommends lowercase for
+            # display) but preserve the zone-id suffix.
+            base, sep, zone = v.partition("%")
+            return base.lower() + (sep + zone if zone else "")
+        if entity_type == "NUCLEI_TEMPLATE":
+            return v.lower().strip()
+        if entity_type == "COMBO_LIST_ENTRY":
+            return v.lower().strip()
+        return v.strip()
+
+    elif entity_type in (
+        # Messaging / identity handle canonicalisation.  Most platforms
+        # treat handles as case-insensitive (Telegram, Discord, Wire,
+        # Wickr, Matrix, XMPP) so we lowercase.  TOX_ID is always uppercase
+        # hex by convention.  SESSION_ID is always lowercase.  ICQ number
+        # is numeric and stays as-is.
+        "TELEGRAM_HANDLE",
+        "DISCORD_HANDLE",
+        "XMPP_JID",
+        "MATRIX_HANDLE",
+        "WIRE_HANDLE",
+        "WICKR_ID",
+        "TOX_ID",
+        "SESSION_ID",
+        "ICQ_NUMBER",
+    ):
+        if entity_type == "TOX_ID":
+            return v.upper().strip()
+        if entity_type == "ICQ_NUMBER":
+            return v.strip()
+        return v.lower().strip()
 
     elif entity_type in ("CVE", "CVE_NUMBER"):
         v = v.upper().strip()
@@ -520,6 +1073,55 @@ def normalize_entities(
                     logger.debug("ONION_URL discarded (not a valid onion address): %r", raw_value)
                     continue
 
+            # Defensive shape check for the new crypto wallet types.  The
+            # extractor already enforces these shapes via regex + validators;
+            # this is a second line of defence so a malformed value can
+            # never reach the DB even if a future refactor weakens the regex.
+            _CRYPTO_WALLET_TYPES = (
+                "LITECOIN_ADDRESS",
+                "ZCASH_ADDRESS",
+                "DOGECOIN_ADDRESS",
+                "XRP_ADDRESS",
+                "SOLANA_ADDRESS",
+                "TRON_ADDRESS",
+                "BITCOIN_CASH_ADDRESS",
+                "DASH_ADDRESS",
+                "ENS_DOMAIN",
+            )
+            if entity_type in _CRYPTO_WALLET_TYPES:
+                if not _validate_crypto_wallet(entity_type, raw_value):
+                    logger.debug(
+                        "Crypto wallet validation failed for %s=%r",
+                        entity_type,
+                        raw_value,
+                    )
+                    continue
+
+            # Defensive shape check for the network / forensic
+            # identifier types added in Phase 2 (final subphase).  The
+            # extractors already enforce these shapes; this is a
+            # second line of defence so a malformed value can never
+            # reach the DB even if a future refactor weakens the regex.
+            _NETWORK_FORENSIC_TYPES = (
+                "IPV6_ADDRESS",
+                "MAC_ADDRESS",
+                "IPFS_CID",
+                "YARA_RULE",
+                "MITRE_TACTIC",
+                "EXPLOIT_DB_ID",
+                "NUCLEI_TEMPLATE",
+                "COMBO_LIST_ENTRY",
+                "CRYPTO_SEED_PHRASE",
+            )
+            if entity_type in _NETWORK_FORENSIC_TYPES:
+                if not _validate_network_forensic(entity_type, raw_value):
+                    logger.debug(
+                        "Network/forensic validation failed for %s=%r",
+                        entity_type,
+                        raw_value,
+                    )
+                    continue
+
             canonical = _normalize_value(entity_type, raw_value)
             if not canonical:
                 continue
@@ -539,6 +1141,11 @@ def normalize_entities(
                     logger.debug(
                         "Filtered blocked entity: %s=%s", entity_type, canonical
                     )
+                    continue
+
+                if entity_type == "ORGANIZATION_NAME" and not _is_valid_org_name(canonical):
+                    noise_count += 1
+                    logger.debug("Filtered noisy ORGANIZATION_NAME: %s", canonical)
                     continue
 
             dedup_key = f"{entity_type}::{canonical}"

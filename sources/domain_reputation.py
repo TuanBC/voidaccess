@@ -27,9 +27,11 @@ import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
+
+from utils.enrichment_cache import DEFAULT_TTL, get_enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,18 @@ _wayback_cache: dict[str, dict] = {}
 CRT_CACHE_TTL = 86400.0      # 24 h
 URLSCAN_CACHE_TTL = 21600.0  # 6 h
 WAYBACK_CACHE_TTL = 86400.0  # 24 h
+
+# Module-level enrichment cache singleton (lazy-init on first lookup).
+# Kept separate from the in-memory dicts above — those protect a single
+# investigation run, this one spans runs / processes.
+_enrichment_cache_singleton: Optional[Any] = None
+
+
+async def _get_enrichment_cache():
+    global _enrichment_cache_singleton
+    if _enrichment_cache_singleton is None:
+        _enrichment_cache_singleton = await get_enrichment_cache()
+    return _enrichment_cache_singleton
 
 _DOMAIN_RE = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$"
@@ -189,6 +203,25 @@ async def query_crt_sh(domain: str) -> list[dict]:
     return results
 
 
+async def _cached_query_crt_sh(domain: str) -> list[dict]:
+    """Cached wrapper around query_crt_sh (72h TTL via DEFAULT_TTL).
+
+    Cache order: enrichment cache (cross-process) → in-memory dict (within
+    process) → live API. Stores an empty list as a sentinel for known-no-records
+    domains to avoid hammering crt.sh for uninteresting targets.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("DOMAIN", domain, "crt_sh")
+    if cached is not None:
+        logger.debug("crt.sh cache hit: %s", domain)
+        return cached
+    result = await query_crt_sh(domain)
+    # Cache both empty and populated lists — repeat lookups for empty domains
+    # shouldn't refire.
+    await cache.set("DOMAIN", domain, "crt_sh", result, DEFAULT_TTL["crt_sh"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # URLScan.io
 # ---------------------------------------------------------------------------
@@ -282,6 +315,22 @@ async def query_urlscan(domain: str) -> dict[str, Any]:
         "domain_reputation: URLScan %s → malicious=%s, %d IPs",
         domain, malicious, len(result["ips"]),
     )
+    return result
+
+
+async def _cached_query_urlscan(domain: str) -> dict[str, Any]:
+    """Cached wrapper around query_urlscan (12h TTL via DEFAULT_TTL).
+
+    Cache order: enrichment cache (cross-process) → in-memory dict (within
+    process) → live API.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("DOMAIN", domain, "urlscan")
+    if cached is not None:
+        logger.debug("URLScan cache hit: %s", domain)
+        return cached
+    result = await query_urlscan(domain)
+    await cache.set("DOMAIN", domain, "urlscan", result, DEFAULT_TTL["urlscan"])
     return result
 
 
@@ -388,6 +437,21 @@ async def query_wayback(domain: str) -> dict[str, Any]:
     return result
 
 
+async def _cached_query_wayback(domain: str) -> dict[str, Any]:
+    """Cached wrapper around query_wayback (7d TTL via DEFAULT_TTL).
+
+    Archive snapshots are immutable — long TTL is safe and worthwhile.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("DOMAIN", domain, "wayback")
+    if cached is not None:
+        logger.debug("Wayback cache hit: %s", domain)
+        return cached
+    result = await query_wayback(domain)
+    await cache.set("DOMAIN", domain, "wayback", result, DEFAULT_TTL["wayback"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Core enrichment check
 # ---------------------------------------------------------------------------
@@ -423,9 +487,9 @@ async def check_domain_reputation(
         return result
 
     crt_data, urlscan_data, wayback_data = await asyncio.gather(
-        query_crt_sh(domain),
-        query_urlscan(domain),
-        query_wayback(domain),
+        _cached_query_crt_sh(domain),
+        _cached_query_urlscan(domain),
+        _cached_query_wayback(domain),
         return_exceptions=True,
     )
 

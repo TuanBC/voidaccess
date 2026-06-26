@@ -30,9 +30,11 @@ import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
+
+from utils.enrichment_cache import DEFAULT_TTL, get_enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,17 @@ VT_BASE_URL = "https://www.virustotal.com/api/v3"
 
 # In-memory per-hash cache: {hash_value: {"result": dict, "loaded_at": float}}
 _hash_cache: dict[str, dict] = {}
+
+# Module-level enrichment cache singleton (lazy-init on first lookup).
+_enrichment_cache_singleton: Optional[Any] = None
+
+
+async def _get_enrichment_cache():
+    global _enrichment_cache_singleton
+    if _enrichment_cache_singleton is None:
+        _enrichment_cache_singleton = await get_enrichment_cache()
+    return _enrichment_cache_singleton
+
 
 # Processing priority: lower number = higher priority
 HASH_TYPES = {
@@ -156,6 +169,35 @@ async def query_hybrid_analysis(hash_value: str) -> dict[str, Any]:
     }
 
 
+async def _cached_query_hybrid_analysis(hash_value: str) -> dict[str, Any]:
+    """Cached wrapper around query_hybrid_analysis (7d TTL via DEFAULT_TTL).
+
+    Sandbox reports are immutable — long TTL is safe. Auth errors, rate
+    limits, and skipped (no-key) results are NOT cached so retries aren't
+    blocked.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("FILE_HASH_SHA256", hash_value, "hybrid_analysis")
+    if cached is not None:
+        logger.debug("HybridAnalysis cache hit: %s", hash_value[:16])
+        return cached
+    result = await query_hybrid_analysis(hash_value)
+    # Only cache results that look like real API responses — must have a
+    # populated ``source`` field and NOT be a transient error / skip marker.
+    source_key = result.get("source") or ""
+    if source_key and source_key not in (
+        "hybrid_analysis_auth_error",
+        "hybrid_analysis_rate_limited",
+        "hybrid_analysis_error",
+        "hybrid_analysis_skipped",
+    ):
+        await cache.set(
+            "FILE_HASH_SHA256", hash_value, "hybrid_analysis",
+            result, DEFAULT_TTL["hybrid_analysis"],
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Source: MalwareBazaar
 # ---------------------------------------------------------------------------
@@ -209,6 +251,25 @@ async def query_malwarebazaar(hash_value: str) -> dict[str, Any]:
         "tags": list(sample.get("tags") or []),
         "sha256": sample.get("sha256_hash") or "",
     }
+
+
+async def _cached_query_malwarebazaar(hash_value: str) -> dict[str, Any]:
+    """Cached wrapper around query_malwarebazaar (48h TTL via DEFAULT_TTL)."""
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("FILE_HASH_SHA256", hash_value, "malwarebazaar")
+    if cached is not None:
+        logger.debug("MalwareBazaar cache hit: %s", hash_value[:16])
+        return cached
+    result = await query_malwarebazaar(hash_value)
+    source_key = result.get("source") or ""
+    # Cache any real API response (found / not_found / error) but skip the
+    # no-key skip marker so re-checks happen once a key is configured.
+    if source_key and source_key != "malwarebazaar_no_key":
+        await cache.set(
+            "FILE_HASH_SHA256", hash_value, "malwarebazaar",
+            result, DEFAULT_TTL["malwarebazaar"],
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +338,23 @@ async def query_threatfox(hash_value: str) -> dict[str, Any]:
         "tags": list(primary.get("tags") or []),
         "associated_iocs": associated_iocs,
     }
+
+
+async def _cached_query_threatfox(hash_value: str) -> dict[str, Any]:
+    """Cached wrapper around query_threatfox (24h TTL via DEFAULT_TTL)."""
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("FILE_HASH_SHA256", hash_value, "threatfox")
+    if cached is not None:
+        logger.debug("ThreatFox cache hit: %s", hash_value[:16])
+        return cached
+    result = await query_threatfox(hash_value)
+    source_key = result.get("source") or ""
+    if source_key and source_key != "threatfox_no_key":
+        await cache.set(
+            "FILE_HASH_SHA256", hash_value, "threatfox",
+            result, DEFAULT_TTL["threatfox"],
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +488,33 @@ async def query_virustotal_hash(hash_value: str) -> dict[str, Any]:
         return {"found": False, "source": "virustotal_error"}
 
 
+async def _cached_query_virustotal(hash_value: str) -> dict[str, Any]:
+    """Cached wrapper around query_virustotal_hash (24h TTL via DEFAULT_TTL).
+
+    Auth / rate-limit / error responses are NOT cached so the next investigation
+    can retry once keys or quotas recover.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("FILE_HASH_SHA256", hash_value, "virustotal")
+    if cached is not None:
+        logger.debug("VirusTotal cache hit: %s", hash_value[:16])
+        return cached
+    result = await query_virustotal_hash(hash_value)
+    source_key = result.get("source") or ""
+    if source_key and source_key not in (
+        "virustotal_auth_error",
+        "virustotal_rate_limited",
+        "virustotal_error",
+        "virustotal_timeout",
+        "virustotal_skipped",
+    ):
+        await cache.set(
+            "FILE_HASH_SHA256", hash_value, "virustotal",
+            result, DEFAULT_TTL["virustotal"],
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Core reputation check
 # ---------------------------------------------------------------------------
@@ -452,10 +557,10 @@ async def check_hash_reputation(
         return result
 
     ha_result, mb_result, tf_result, vt_result = await asyncio.gather(
-        query_hybrid_analysis(hash_value),
-        query_malwarebazaar(hash_value),
-        query_threatfox(hash_value),
-        query_virustotal_hash(hash_value),
+        _cached_query_hybrid_analysis(hash_value),
+        _cached_query_malwarebazaar(hash_value),
+        _cached_query_threatfox(hash_value),
+        _cached_query_virustotal(hash_value),
         return_exceptions=True,
     )
 

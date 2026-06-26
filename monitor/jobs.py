@@ -8,6 +8,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
+import graph
+import scraper.scrape as scrape
+import search.search as search
+import vector
+from extractor import extract_entities_from_page, extract_entities_from_pages
+from monitor import _db
+from monitor.diff import compute_diff
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -27,13 +35,6 @@ async def run_keyword_watch(watch: dict, llm=None) -> dict[str, Any]:
     """
     Full pipeline: search → scrape → dedup → extract → graph rebuild.
     """
-    import scraper.scrape as scrape
-    import search.search as search
-    import vector
-    from extractor import extract_entities_from_pages
-    from monitor import _db
-    from monitor.diff import compute_diff
-
     name = watch.get("name", "")
     query = watch.get("query", "")
     errors: list[str] = []
@@ -108,7 +109,6 @@ async def run_keyword_watch(watch: dict, llm=None) -> dict[str, Any]:
             errors.append(str(exc))
 
     try:
-        import graph
         graph.build_graph_from_db()
     except Exception as exc:
         logger.warning("build_graph_from_db: %s", exc)
@@ -127,12 +127,6 @@ async def run_keyword_watch(watch: dict, llm=None) -> dict[str, Any]:
 
 async def run_url_watch(watch: dict) -> dict[str, Any]:
     """Scrape one URL, diff against DB-backed previous content, extract if changed."""
-    import scraper.scrape as scrape
-    import vector
-    from extractor import extract_entities_from_page
-    from monitor import _db
-    from monitor.diff import compute_diff
-
     name = watch.get("name", "")
     url = watch.get("url", "")
     old_content = _db.get_last_cleaned_text_for_url(url)

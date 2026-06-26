@@ -470,6 +470,7 @@ export default function InvestigationPage() {
               onNodeClick={handleNodeClick}
               focusNodeId={focusNodeId}
               onFocusHandled={() => setFocusNodeId(null)}
+              investigationId={investigationParamId}
             />
           )}
         </main>

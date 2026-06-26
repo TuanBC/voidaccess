@@ -173,6 +173,22 @@ class Investigation(Base):
         nullable=True,
         index=True,
     )
+    # Free-form JSON metadata bag for per-investigation artifacts that don't
+    # deserve their own column.  Used by Phase 6.1 to persist:
+    #   - sources_used:        per-source status dict (previously only in
+    #                          module-level memory cache).
+    #   - infrastructure_clusters: DNS co-location clusters (previously only
+    #                          in module-level memory cache).
+    # Default {} via server_default keeps the column non-null on PostgreSQL
+    # and SQLite alike so callers can `metadata.get("...")` without a None
+    # guard.  Backfilled in migration 0023.
+    metadata_json: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        "metadata",  # DB column name (Python attr is metadata_json to avoid
+                     # colliding with SQLAlchemy's Base.metadata)
+        sa.JSON,
+        nullable=True,
+        default=None,
+    )
 
     sources: Mapped[List["Source"]] = relationship(
         "Source",
@@ -180,6 +196,9 @@ class Investigation(Base):
         back_populates="investigations",
         lazy="select",
     )
+
+    def __repr__(self) -> str:
+        return f"<Investigation {self.id} query={self.query!r}>"
 
 
 
@@ -443,12 +462,17 @@ class Entity(Base):
         "EntityRelationship",
         foreign_keys="EntityRelationship.entity_a_id",
         back_populates="entity_a",
+        cascade="all, delete-orphan",
     )
     relationships_as_entity_b: Mapped[List["EntityRelationship"]] = relationship(
         "EntityRelationship",
         foreign_keys="EntityRelationship.entity_b_id",
         back_populates="entity_b",
+        cascade="all, delete-orphan",
     )
+
+    def __repr__(self) -> str:
+        return f"<Entity {self.entity_type!r} value={self.value!r}>"
 
 
 
@@ -549,6 +573,9 @@ class Source(Base):
         lazy="select",
     )
 
+    def __repr__(self) -> str:
+        return f"<Source {self.onion_address!r}>"
+
 
 class EntityRelationship(Base):
     """
@@ -616,3 +643,159 @@ class EntityRelationship(Base):
         back_populates="relationships_as_source",
     )
 
+
+# ---------------------------------------------------------------------------
+# Actor profiles (Phase 7 — persistent actor aggregates)
+# ---------------------------------------------------------------------------
+#
+# These tables are the source of truth for cross-investigation actor data.
+# Unlike the Entity table (which is per-investigation, per-page), these rows
+# survive across restarts and dedupe by canonical handle.  One row per
+# unique actor handle; aliases and infrastructure are joined rows.
+
+
+class ActorProfile(Base):
+    """
+    Persistent profile for a unique threat actor / handle.
+
+    One row per *canonical_handle* (lowercased, whitespace-stripped, no
+    leading '@').  When the same handle is seen in N different
+    investigations, `investigation_count` tracks how many distinct
+    investigations surfaced it.  This is the table the
+    ``/actors/{handle}`` and ``voidaccess actor`` commands read from.
+    """
+
+    __tablename__ = "actor_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    canonical_handle: Mapped[str] = mapped_column(
+        sa.String(255), unique=True, nullable=False, index=True
+    )
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True, index=True
+    )
+    investigation_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0"
+    )
+    confidence: Mapped[float] = mapped_column(
+        sa.Float, nullable=False, default=0.85, server_default="0.85"
+    )
+    notes: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    aliases: Mapped[List["ActorAlias"]] = relationship(
+        "ActorAlias",
+        back_populates="actor",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+    infrastructure: Mapped[List["ActorInfrastructure"]] = relationship(
+        "ActorInfrastructure",
+        back_populates="actor",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+
+class ActorAlias(Base):
+    """
+    An alternate spelling / variant handle linked to an actor profile.
+
+    Examples: forum_handle (raw @lockbit), pgp_fingerprint (long hex),
+    email (lockbit@protonmail.com), wallet (bc1q...), domain
+    (lockbit-leaks.example).  ``alias_type`` is a free-form label so the
+    CLI/API can render it appropriately without enum churn.
+    """
+
+    __tablename__ = "actor_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    actor_id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True),
+        sa.ForeignKey("actor_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    alias_value: Mapped[str] = mapped_column(
+        sa.String(500), nullable=False
+    )
+    alias_type: Mapped[Optional[str]] = mapped_column(
+        sa.String(50), nullable=True
+    )
+    source_investigation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.UUID(as_uuid=True), nullable=True
+    )
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    confidence: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint("actor_id", "alias_value"),
+    )
+
+    actor: Mapped["ActorProfile"] = relationship(
+        "ActorProfile", back_populates="aliases"
+    )
+
+
+class ActorInfrastructure(Base):
+    """
+    Infrastructure (IP, domain, onion URL, wallet, etc.) linked to an actor.
+
+    Distinct from ``Entity`` because one IP can be linked to multiple
+    actors (shared hosting) and we want a persistent, cross-investigation
+    view.  ``UNIQUE(actor_id, entity_type, entity_value)`` so the same
+    IOC linked twice to the same actor does not create a duplicate row.
+    """
+
+    __tablename__ = "actor_infrastructure"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    actor_id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True),
+        sa.ForeignKey("actor_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    entity_type: Mapped[str] = mapped_column(sa.String(50), nullable=False)
+    entity_value: Mapped[str] = mapped_column(sa.String(500), nullable=False)
+    source_investigation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.UUID(as_uuid=True), nullable=True
+    )
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    confidence: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint("actor_id", "entity_type", "entity_value"),
+        sa.Index("ix_actor_infra_actor", "actor_id"),
+        sa.Index("ix_actor_infra_type_value", "entity_type", "entity_value"),
+    )
+
+    actor: Mapped["ActorProfile"] = relationship(
+        "ActorProfile", back_populates="infrastructure"
+    )

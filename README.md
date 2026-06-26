@@ -19,6 +19,21 @@ Commercial threat intelligence platforms often charge prohibitive annual fees fo
 
 ---
 
+## What's New in v1.5.0
+
+- 37 new entity types across crypto, credentials, messaging, and network/forensic indicators.
+- YARA, Snort, Suricata, and IOC package ZIP exports.
+- Persistent actor profiles with aliases, infrastructure, notes, and timelines.
+- Cross-alias resolution using shared infrastructure, shared PGP, string similarity, temporal co-activity, and co-investigation.
+- Backend graph community detection and path-between-nodes queries.
+- CLI graph browser path finder and frontend Find Path highlighting.
+- Per-phase pipeline timeouts for enrichment, graph, summary, finalize, and parallel sources.
+- `sources_used` and `infrastructure_clusters` persist in investigation metadata.
+- Cross-run enrichment cache with Redis, SQLite, and memory backends.
+- Auto-discovery and weekly validation of `.onion` seeds.
+
+---
+
 ## Quick Start
 
 ### Option A - CLI (no Docker, 30 seconds)
@@ -56,11 +71,27 @@ The Docker stack includes PostgreSQL, Tor, FastAPI, and Next.js.
 |---|---|
 | `voidaccess investigate` | Run an investigation |
 | `voidaccess show` | Interactive entity browser |
-| `voidaccess export` | Export STIX/MISP/Sigma/CSV/MD |
+| `voidaccess export` | Export STIX/MISP/Sigma/YARA/Snort/Suricata/package/CSV/MD/JSON |
+| `voidaccess package <file>` | Export an IOC ZIP bundle |
 | `voidaccess enrich` | Re-enrich saved results |
 | `voidaccess list` | List saved investigations |
-| `voidaccess status` | Config and API key status |
+| `voidaccess status` | Config, API key, cache, engine, and seed status |
+| `voidaccess actors` | List persistent actor profiles |
+| `voidaccess actor <handle>` | Show an actor profile with aliases, infrastructure, notes, and history |
+| `voidaccess actor <handle> --timeline` | Show an actor activity timeline |
+| `voidaccess actor <handle> --note "text"` | Append an analyst note to an actor profile |
+| `voidaccess timeline <handle>` | Shortcut for `voidaccess actor <handle> --timeline` |
 | `voidaccess configure` | Setup wizard |
+
+Export examples:
+
+```bash
+voidaccess package investigation.json
+voidaccess export investigation.json --format yara
+voidaccess export investigation.json --format snort
+voidaccess export investigation.json --format suricata
+voidaccess status --seeds
+```
 
 ### CLI vs Docker
 
@@ -121,14 +152,17 @@ VoidAccess handles the complexity of dark web research through a rigorous sequen
 
 ## What It Extracts
 
-The extraction pipeline identifies these entity types:
+The extraction pipeline identifies 55+ entity types:
 
 | Category | Examples |
 |---|---|
-| **Cryptocurrency** | Bitcoin, Ethereum, Monero wallet addresses |
+| **Cryptocurrency** | Bitcoin, Ethereum, Monero, Litecoin, Zcash, Dogecoin, XRP, Solana, Tron, Bitcoin Cash, Dash, ENS |
 | **Network Indicators** | IPv4 addresses, .onion URLs, domains, email addresses, PGP keys |
 | **File Indicators** | MD5, SHA1, SHA256 hashes |
-| **Vulnerabilities** | CVE numbers, MITRE ATT&CK techniques |
+| **Credentials** | AWS keys, GitHub tokens, Slack tokens, Discord tokens, JWTs, Google API keys, Stripe keys, generic API keys, stealer log entries |
+| **Messaging Handles** | Telegram, Discord, XMPP, Tox, Session, Matrix, Wire, ICQ, Wickr |
+| **Network/Forensic** | IPv6, MAC addresses, IPFS CIDs, combo-list entries, YARA rules, MITRE tactics, Exploit-DB IDs, Nuclei templates, seed phrases |
+| **Vulnerabilities** | CVE numbers, MITRE ATT&CK techniques and tactics |
 | **Threat Actors** | Actor handles, malware families, ransomware group names |
 | **Paste Sites** | Pastebin, Ghostbin, Rentry, and similar links |
 | **People/Orgs** | Named persons, organization names, locations |
@@ -168,7 +202,19 @@ Export formats:
 - **STIX 2.1** — bundles with indicators, threat actors, malware objects
 - **MISP JSON** — events with galaxies for direct import
 - **Sigma rules** — auto-generated detection rules from extracted IOCs
-- **CSV** — flat entity dumps for spreadsheet analysis
+- **YARA rules** - generated rules for malware, credentials, infrastructure, and IOC strings
+- **Snort rules** - network detection rules for IPs, domains, URLs, and selected IOC content
+- **Suricata rules** - Suricata-compatible network rules with the same IOC coverage as Snort
+- **IOC package ZIP** - 21-file bundle containing text IOC lists, STIX, MISP, Sigma, YARA, Snort, Suricata, summary, and CSV
+- **CSV** - flat entity dumps for spreadsheet analysis
+
+---
+
+## Actor Intelligence
+
+VoidAccess v1.5.0 persists actor profiles across investigations in `actor_profiles`, with linked aliases and infrastructure in `actor_aliases` and `actor_infrastructure`. Profiles are populated from threat actor, ransomware group, and handle entities, then enriched with co-occurring infrastructure and timeline events.
+
+Cross-alias resolution scores five signals: shared infrastructure, shared PGP, string similarity, temporal co-activity, and co-investigation. Use `voidaccess actors` to list profiles, `voidaccess actor <handle>` for the full profile, `voidaccess actor <handle> --timeline` for chronology, and `voidaccess actor <handle> --note "text"` for analyst notes.
 
 ---
 

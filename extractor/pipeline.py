@@ -21,13 +21,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 from extractor.regex_patterns import extract_all as _regex_extract_all
 from extractor.ner import extract_named_entities as _ner_extract
 from extractor.llm_extract import extract_with_llm as _llm_extract
-from extractor.normalizer import normalize_entities as _normalize, merge_with_db as _merge_db, NormalizedEntity, resolve_entity_type_conflicts as _resolve_conflicts
+from extractor.normalizer import (
+    normalize_entities as _normalize,
+    merge_with_db as _merge_db,
+    NormalizedEntity,
+    resolve_entity_type_conflicts as _resolve_conflicts,
+    _REGEX_TYPES as _HIGH_CONFIDENCE_REGEX_TYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,115 @@ PER_TYPE_CAPS = {
     "LOCATION": 20,
     "THREAT_ACTOR_HANDLE": 80,
 }
+
+# ---------------------------------------------------------------------------
+# LLM-extraction page selection
+# ---------------------------------------------------------------------------
+#
+# `extract_entities_from_pages` is invoked on 15-22 pages per investigation
+# and each page is chunked into ~3 LLM calls, yielding 45-66 LLM calls per
+# investigation.  That's expensive.  We pre-score the pages and only run the
+# LLM tier on the top `max_llm_pages` of them.
+#
+# Score components (higher = LLM adds more value):
+#   - low regex entity count (< 3 entities)        +10.0  (LLM can fill gaps)
+#   - text content length 500+ chars                up to +5.0
+#   - source_type in {tor, onion} or .onion URL     +5.0  (dark-web specific)
+#   - tie-breaker: text length / 1000              up to +1.0
+#
+# Pages with >= `_SKIP_LLM_THRESHOLD` high-confidence regex IOCs are
+# already well-covered and get a strong negative score so they are never
+# selected.  This implements step (a) of the optimisation brief.
+
+_SKIP_LLM_THRESHOLD = 5  # high-confidence regex IOCs above which we skip LLM
+_LLM_SKIP_PENALTY = -1000.0
+
+# LLM tiers adds value for these entity types specifically:
+# THREAT_ACTOR_HANDLE, MALWARE_FAMILY, DATE, ORGANIZATION_NAME (filtered),
+# MITRE_TECHNIQUE, BTC/XMR/ETH wallets, file hashes.  The regex/NER tiers
+# are weak for THREAT_ACTOR_HANDLE without @-prefix, MALWARE_FAMILY outside
+# the dictionary, and DATE in informal contexts — so prioritising pages
+# with low existing coverage maximises what LLM adds.
+
+
+def _score_pages_for_llm(
+    pages: list[dict],
+    max_llm_pages: int,
+) -> set[str]:
+    """
+    Return the set of page URLs that should get LLM extraction.
+
+    Selection rules:
+      1. Skip pages with >= 5 high-confidence regex IOCs (already covered).
+      2. Prioritise pages with low regex coverage, long text, tor/onion source.
+      3. Cap at `max_llm_pages` pages.
+
+    Synchronous — runs once at the start of `extract_entities_from_pages`
+    before the per-page async fan-out.  Regex is fast enough that doing
+    it twice (once here for scoring, once inside each page's
+    `extract_entities_from_page`) is cheaper than threading the result
+    through the call graph.
+    """
+    if not pages or max_llm_pages <= 0:
+        return set()
+
+    scored: list[tuple[float, str]] = []
+    for page in pages:
+        url = (page.get("url") or "").strip()
+        if not url:
+            continue
+        text = (
+            page.get("text")
+            or page.get("content")
+            or page.get("cleaned_text")
+            or ""
+        )
+        source_type = (page.get("source_type") or "").lower()
+        is_tor_source = (
+            source_type in ("tor", "onion")
+            or ".onion" in url.lower()
+        )
+
+        # Cheap regex-only pass for the score
+        try:
+            regex_entities = _regex_extract_all(text)
+        except Exception:
+            regex_entities = {}
+
+        high_conf_count = sum(
+            len(v)
+            for k, v in regex_entities.items()
+            if k in _HIGH_CONFIDENCE_REGEX_TYPES
+        )
+        if high_conf_count >= _SKIP_LLM_THRESHOLD:
+            logger.debug(
+                "LLM-skip: %s has %d high-conf regex IOCs",
+                url, high_conf_count,
+            )
+            continue
+
+        total_count = sum(len(v) for v in regex_entities.values())
+        text_len = len(text)
+
+        score = 0.0
+        if total_count < 3:
+            score += 10.0
+        if text_len > 500:
+            score += min(text_len / 200.0, 5.0)
+        if is_tor_source:
+            score += 5.0
+        # Tie-breaker: prefer longer pages (more LLM value per call)
+        score += min(text_len / 1000.0, 1.0)
+
+        scored.append((score, url))
+
+    scored.sort(key=lambda pair: -pair[0])
+    selected = {url for _, url in scored[:max_llm_pages]}
+    logger.info(
+        "LLM page selection: %d/%d pages selected (cap=%d)",
+        len(selected), len(pages), max_llm_pages,
+    )
+    return selected
 
 _ENTITY_TYPE_PRIORITY = {
     1: frozenset({"CVE", "CVE_NUMBER", "IP_ADDRESS", "IPV6_ADDRESS", "FILE_HASH", "FILE_HASH_MD5", "FILE_HASH_SHA1", "FILE_HASH_SHA256", "FILE_HASH_SHA512", "ONION_URL", "DOMAIN", "DOMAIN_NAME"}),
@@ -67,6 +182,15 @@ class ExtractionResult:
     errors: list[str] = field(default_factory=list)
     entities: list = field(default_factory=list)
 
+    def __iter__(self):
+        return iter(self.entities)
+
+    def __len__(self) -> int:
+        return len(self.entities)
+
+    def __getitem__(self, index):
+        return self.entities[index]
+
 
 # ---------------------------------------------------------------------------
 # Public interface
@@ -82,6 +206,7 @@ async def extract_entities_from_page(
     run_llm_extraction: bool = False,
     disable_cache: Optional[bool] = None,
     persist: bool = True,
+    force_skip_llm: bool = False,
 ) -> ExtractionResult:
     """
     Run the full extraction pipeline for a single page.
@@ -92,6 +217,11 @@ async def extract_entities_from_page(
 
     Set persist=False to skip DB persistence (used when collecting entities
     for batch capping before write).
+
+    `force_skip_llm=True` overrides `run_llm_extraction` for this single
+    page — used by `extract_entities_from_pages` after the page-priority
+    pre-score decided this page should not get LLM (already well-covered
+    by regex, or below the top-N priority cut).
     """
     errors: list[str] = []
 
@@ -125,8 +255,12 @@ async def extract_entities_from_page(
 
     # -----------------------------------------------------------------------
     # Stage 3 — LLM (optional)
+    #
+    # The `force_skip_llm` flag wins over `run_llm_extraction` so the page
+    # selector can deterministically drop a page even when the caller
+    # requested LLM globally (e.g. cap reached, or already well-covered).
     # -----------------------------------------------------------------------
-    if run_llm_extraction and llm is not None:
+    if run_llm_extraction and llm is not None and not force_skip_llm:
         try:
             import hashlib
             page_hash = hashlib.sha256(page_text.encode()).hexdigest() if page_text else None
@@ -193,6 +327,8 @@ async def extract_entities_from_pages(
     max_concurrent: int = 5,
     disable_cache: Optional[bool] = None,
     entity_cap: int = 400,
+    max_llm_pages: int = 10,
+    llm_progress_callback: Optional[Any] = None,
 ) -> list[ExtractionResult]:
     """
     Run extraction concurrently across a list of pages.
@@ -206,8 +342,48 @@ async def extract_entities_from_pages(
 
     Before DB persistence, applies entity cap (default 400) ranked by:
     confidence (primary), entity type priority (secondary), occurrence count (tertiary).
+
+    LLM extraction cap
+    ------------------
+    When `run_llm_extraction` is True and `llm` is provided, the LLM tier
+    only runs on up to `max_llm_pages` pages per call.  Pages are scored by
+    LLM value (low regex coverage, long text, tor/onion source) so the
+    most informative pages get the LLM call budget.  Pages with
+    already-strong regex coverage (≥ 5 high-confidence IOCs) are skipped.
+
+    The optional `llm_progress_callback` is an async or sync callable
+    invoked after each LLM-extracted page completes:
+        callback(page_index_1based, total_llm_pages, page_url)
+    Used by the API route to emit SSE progress events.
     """
     semaphore = asyncio.Semaphore(max_concurrent)
+
+    # -----------------------------------------------------------------------
+    # Pre-score pages to decide which ones get LLM extraction.
+    # Only runs when LLM is actually available — otherwise every page is
+    # already in the regex/NER-only path.
+    # -----------------------------------------------------------------------
+    if run_llm_extraction and llm is not None and pages:
+        llm_selected_urls = _score_pages_for_llm(pages, max_llm_pages)
+    else:
+        llm_selected_urls = set()
+
+    llm_total = len(llm_selected_urls)
+    llm_done_counter = {"n": 0}
+    llm_done_lock = asyncio.Lock()
+
+    async def _emit_progress(url: str) -> None:
+        if llm_progress_callback is None or llm_total == 0:
+            return
+        async with llm_done_lock:
+            llm_done_counter["n"] += 1
+            current = llm_done_counter["n"]
+        try:
+            cb = llm_progress_callback(current, llm_total, url)
+            if asyncio.iscoroutine(cb):
+                await cb
+        except Exception as exc:
+            logger.debug("llm_progress_callback raised (non-fatal): %s", exc)
 
     async def _process(page: dict) -> ExtractionResult:
         async with semaphore:
@@ -218,8 +394,16 @@ async def extract_entities_from_pages(
                 or page.get("cleaned_text")
                 or ""
             )
+            # Per-page LLM decision: only run LLM tier if the URL is in the
+            # pre-scored selection set.  This caps LLM spend and prioritises
+            # the pages where LLM adds the most value.
+            page_runs_llm = (
+                run_llm_extraction
+                and llm is not None
+                and url in llm_selected_urls
+            )
             try:
-                return await extract_entities_from_page(
+                result = await extract_entities_from_page(
                     page_text=text,
                     page_url=url,
                     page_id=page.get("page_id"),
@@ -228,6 +412,7 @@ async def extract_entities_from_pages(
                     run_llm_extraction=run_llm_extraction,
                     disable_cache=disable_cache,
                     persist=False,
+                    force_skip_llm=not page_runs_llm,
                 )
             except Exception as exc:
                 logger.error("Page processing failed for %s: %s", url, exc)
@@ -238,6 +423,10 @@ async def extract_entities_from_pages(
                     entity_ids=[],
                     errors=[str(exc)],
                 )
+
+            if page_runs_llm:
+                await _emit_progress(url)
+            return result
 
     results = list(await asyncio.gather(*[_process(p) for p in pages]))
 
@@ -362,9 +551,14 @@ def apply_entity_cap(
     if removed_confidence:
         logger.warning(f"Entity confidence filter removed {removed_confidence} low-confidence entities")
 
-    # Count occurrences per entity (by type+value)
+    # Count occurrences per entity (by type+value) and boost confidence
+    total_pages = len(set(e.source_url for e in filtered)) or 1
     for ent in filtered:
-        ent._occurrence = _occurrence_count(ent, filtered)
+        occ = _occurrence_count(ent, filtered)
+        ent._occurrence = occ
+        occurrence_ratio = occ / total_pages
+        confidence_boost = min(occurrence_ratio * 0.10, 0.10)
+        ent.confidence = min(ent.confidence + confidence_boost, 1.0)
 
     # Step b: per-type sub-caps
     filtered = _apply_per_type_caps(filtered)

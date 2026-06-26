@@ -681,6 +681,109 @@ async def _gather_all(
 
 
 # ---------------------------------------------------------------------------
+# Seed discovery (fire-and-forget, runs alongside DB persistence)
+# ---------------------------------------------------------------------------
+
+# Cap discovered seeds per investigation so a runaway scrape loop
+# can't dump thousands of entries into the seed JSON file.  Per-page
+# cap is enforced inside extract_onion_urls_from_content().
+SEED_DISCOVERY_MAX_PER_INVESTIGATION = 100
+
+
+async def _discover_seeds_from_one_page(
+    page_url: str,
+    content: str,
+    investigation_id: Optional[str] = None,
+    investigation_counter: Optional[dict] = None,
+) -> int:
+    """
+    Extract .onion hostnames from one scraped page and submit each as a
+    discovered seed.  Designed to be awaited concurrently from the
+    scraping orchestrator — never raises, never blocks the event loop
+    on JSON writes (delegated to asyncio.to_thread inside
+    SeedManager.add_discovered_seed_async).
+
+    Args:
+        page_url: the page the content was scraped from (used as
+            source_url provenance, and also gates the .onion-only check).
+        content:  the extracted plain-text content of the page.
+        investigation_id: optional — recorded as provenance on each seed.
+        investigation_counter: optional mutable dict with key
+            ``"count"`` — used to enforce the per-investigation cap.
+            When the cap is reached the function returns 0 immediately.
+
+    Returns:
+        Number of new seeds successfully submitted.
+    """
+    if not page_url or not content:
+        return 0
+
+    # Only mine .onion pages for .onion references.  We deliberately
+    # ignore clearnet pages so the scraper doesn't pick up example
+    # addresses from documentation, blog posts, etc.
+    if ".onion" not in page_url.lower():
+        return 0
+
+    # Enforce per-investigation cap early to skip extraction cost.
+    if investigation_counter is not None:
+        if investigation_counter.get("count", 0) >= SEED_DISCOVERY_MAX_PER_INVESTIGATION:
+            return 0
+
+    try:
+        from sources.seed_manager import (
+            extract_onion_urls_from_content,
+            get_seed_manager,
+        )
+    except Exception as exc:
+        _logger.debug("Seed discovery import failed (non-fatal): %s", exc)
+        return 0
+
+    try:
+        discovered = extract_onion_urls_from_content(content)
+    except Exception as exc:
+        _logger.debug("extract_onion_urls_from_content failed: %s", exc)
+        return 0
+
+    if not discovered:
+        return 0
+
+    seed_manager = get_seed_manager()
+    added = 0
+    for hostname in discovered:
+        if investigation_counter is not None:
+            if investigation_counter.get("count", 0) >= SEED_DISCOVERY_MAX_PER_INVESTIGATION:
+                break
+        target_url = f"http://{hostname}"
+        try:
+            ok = await seed_manager.add_discovered_seed_async(
+                url=target_url,
+                source_url=page_url,
+                investigation_id=investigation_id,
+            )
+        except Exception as exc:
+            _logger.debug(
+                "Seed discovery submit failed for %s (non-fatal): %s",
+                hostname, exc,
+            )
+            continue
+        if ok:
+            added += 1
+            if investigation_counter is not None:
+                investigation_counter["count"] = (
+                    investigation_counter.get("count", 0) + 1
+                )
+
+    if added:
+        _logger.info(
+            "Seed discovery: +%d new .onion addresses from %s",
+            added,
+            page_url[:60],
+        )
+
+    return added
+
+
+# ---------------------------------------------------------------------------
 # DB persistence (runs synchronously after asyncio.run() returns)
 # ---------------------------------------------------------------------------
 
@@ -746,7 +849,11 @@ def _persist_pages(
 # Public API
 # ---------------------------------------------------------------------------
 
-async def scrape_multiple(urls_data, max_workers: int = 5) -> Dict[str, str]:
+async def scrape_multiple(
+    urls_data,
+    max_workers: int = 5,
+    investigation_id: Optional[str] = None,
+) -> Dict[str, str]:
     """
     Scrape a list of URLs concurrently and return a dict mapping URL → content.
 
@@ -757,7 +864,15 @@ async def scrape_multiple(urls_data, max_workers: int = 5) -> Dict[str, str]:
         2. await _gather_all(...)  — async fetch
         3. Truncate each result to MAX_RETURN_CHARS
         4. Write pages to DB if DATABASE_URL is configured
-        5. Return {url: content} dict
+        5. Fire-and-forget seed discovery for .onion pages (non-blocking,
+           bounded per page and per investigation, swallowed on error)
+        6. Return {url: content} dict
+
+    Args:
+        urls_data:        iterable of URL dicts (Phase 0 contract).
+        max_workers:      max concurrency for Tor/.onion fetches.
+        investigation_id: optional — recorded as provenance on discovered
+                          seeds.  Pass ``None`` to skip provenance tracking.
     """
     if not isinstance(urls_data, (list, tuple)):
         return {}
@@ -806,6 +921,42 @@ async def scrape_multiple(urls_data, max_workers: int = 5) -> Dict[str, str]:
 
     # DB persistence phase
     await asyncio.to_thread(_persist_pages, db_items)
+
+    # Seed discovery phase — fire-and-forget across all .onion pages,
+    # bounded by a per-investigation cap and per-page cap.  Never raises;
+    # failures are swallowed inside _discover_seeds_from_one_page.
+    discovery_counter: dict = {"count": 0}
+    discovery_tasks: List[asyncio.Task] = []
+    for url, _display, _raw, db_text, _posted in raw_results:
+        if not url or not db_text:
+            continue
+        if ".onion" not in url.lower():
+            continue
+        discovery_tasks.append(
+            asyncio.create_task(
+                _discover_seeds_from_one_page(
+                    page_url=url,
+                    content=db_text,
+                    investigation_id=investigation_id,
+                    investigation_counter=discovery_counter,
+                )
+            )
+        )
+    if discovery_tasks:
+        # Bounded concurrency — 4 concurrent discovery coroutines is more
+        # than enough since each one delegates the JSON write to a thread.
+        sem = asyncio.Semaphore(4)
+
+        async def _run_discovery(t: asyncio.Task) -> None:
+            async with sem:
+                try:
+                    await t
+                except Exception as exc:
+                    _logger.debug(
+                        "Seed discovery task errored (non-fatal): %s", exc
+                    )
+
+        await asyncio.gather(*[_run_discovery(t) for t in discovery_tasks])
 
     return results
 

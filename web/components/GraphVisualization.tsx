@@ -32,6 +32,25 @@ const CAT_COLOR: Record<EntityCategoryKey, string> = {
   OTHER:        "#4a5260",
 };
 
+// Twelve visually distinct hues chosen for the dark VoidAccess canvas.
+// `nodeReducer` still overlays NODE_DIM when a node is filtered out by
+// community, so these only need to be distinguishable from each other and
+// from the pinned/selected states.
+const COMMUNITY_COLORS: readonly string[] = [
+  "#6366f1", // indigo
+  "#ec4899", // pink
+  "#14b8a6", // teal
+  "#f59e0b", // amber
+  "#8b5cf6", // violet
+  "#06b6d4", // cyan
+  "#f97316", // orange
+  "#10b981", // emerald
+  "#ef4444", // red
+  "#3b82f6", // blue
+  "#a855f7", // purple
+  "#22c55e", // green
+];
+
 const EDGE_DEFAULT  = "rgba(90,110,140,0.12)";
 const EDGE_ACTIVE   = "#9B9FEE";
 const NODE_DIM      = "#181d26";
@@ -78,16 +97,34 @@ function smartLabel(raw: string): string {
 function buildGraph(data: InvestigationGraphResponse, strongOnly: boolean): Graph {
   const g = new Graph({ multi: true, type: "directed" });
 
+  // Backend-provided community partition (preferred — deterministic, server-side).
+  // Falls back to client-side Louvain for older API responses that don't ship
+  // the communities dict yet.
+  const backendCommunities: Record<string, number> = data.communities ?? {};
+  const useBackend =
+    Object.keys(backendCommunities).length > 0 &&
+    // Guard against an empty / placeholder object from a stale server
+    Object.values(backendCommunities).some((v) => Number.isFinite(v));
+
   for (const n of data.nodes) {
     if (g.hasNode(n.id)) continue;
     const cat = graphNodeTypeToCategory(String(n.type ?? ""));
+    // Seed community index from the backend payload so the per-node colour
+    // picker below has something to read.  Final community is applied after
+    // the Louvain fallback path runs.
+    const seededCommunity = useBackend
+      ? String(backendCommunities[n.id] ?? 0)
+      : "0";
+    const seedColor = COMMUNITY_COLORS[
+      Number(seededCommunity) % COMMUNITY_COLORS.length
+    ];
     g.addNode(n.id, {
       label:      smartLabel(n.id),
       size:       5,
-      color:      CAT_COLOR[cat],
+      color:      seedColor,
       origColor:  CAT_COLOR[cat],
       vaCategory: cat,
-      community:  "0",
+      community:  seededCommunity,
       raw:        n as GraphNodeJSON,
     });
   }
@@ -113,8 +150,36 @@ function buildGraph(data: InvestigationGraphResponse, strongOnly: boolean): Grap
     g.setNodeAttribute(n, "origSize", sz);
   });
 
-  // Community detection first
-  try { louvain.assign(g, { nodeCommunityAttribute: "community" }); } catch { /* ok */ }
+  // Community assignment.  Preferred: server-computed (deterministic, fast).
+  // Fallback: client-side Louvain — only kicks in for older investigations
+  // whose API response predates the `communities` field.
+  if (useBackend) {
+    g.forEachNode((nodeId) => {
+      const communityId = backendCommunities[nodeId] ?? 0;
+      const color =
+        COMMUNITY_COLORS[communityId % COMMUNITY_COLORS.length];
+      g.setNodeAttribute(nodeId, "community", String(communityId));
+      g.setNodeAttribute(nodeId, "color",     color);
+    });
+  } else {
+    try {
+      louvain.assign(g, { nodeCommunityAttribute: "community" });
+      // Louvain doesn't colour nodes — do that ourselves so the rest of the
+      // reducer logic (pinned / selected / filtered) keeps working unchanged.
+      g.forEachNode((nodeId) => {
+        const communityId = Number(
+          g.getNodeAttribute(nodeId, "community") ?? 0
+        );
+        g.setNodeAttribute(
+          nodeId,
+          "color",
+          COMMUNITY_COLORS[communityId % COMMUNITY_COLORS.length],
+        );
+      });
+    } catch {
+      /* ok — visualisation degrades to all-community-0 colour */
+    }
+  }
 
   // Pre-position nodes by community sector so FA2 starts well-separated
   const commSet: Record<string, boolean> = {};
@@ -334,7 +399,33 @@ export type GraphVisualizationProps = {
   focusNodeId:      string | null;
   onFocusHandled:   () => void;
   searchQuery?:     string;
+  /** Optional — enables the "Find Path" button + modal. */
+  investigationId?: string;
 };
+
+// ─── Path-finding types ──────────────────────────────────────────────────────
+
+interface PathHop {
+  entity_id:    string | null;
+  node_id:      string;
+  entity_type:  string;
+  canonical_value: string;
+  confidence:   number;
+  relationship_to_previous?: {
+    type: string;
+    confidence: number;
+  };
+}
+
+interface PathResponse {
+  found:         boolean;
+  path_length:   number | null;
+  hops:          PathHop[];
+  from_entity:   { entity_id: string; entity_type: string; canonical_value: string } | null;
+  to_entity:     { entity_id: string; entity_type: string; canonical_value: string } | null;
+  message?:      string | null;
+  directed?:     boolean;
+}
 
 export function GraphVisualization({
   data,
@@ -347,6 +438,7 @@ export function GraphVisualization({
   focusNodeId,
   onFocusHandled,
   searchQuery,
+  investigationId,
 }: GraphVisualizationProps) {
   const containerRef  = useRef<HTMLDivElement>(null);
   const sigmaRef      = useRef<Sigma | null>(null);
@@ -385,6 +477,21 @@ export function GraphVisualization({
   const [selectedNodeDetail, setSelectedNodeDetail] = useState<SelectedNodeData | null>(null);
   // FIX 4: legend collapsed state
   const [legendCollapsed,    setLegendCollapsed]    = useState(false);
+  // Path-finding: dialog visibility, request state, and the highlighted subgraph.
+  const [pathDialogOpen, setPathDialogOpen]     = useState(false);
+  const [pathQuerying,   setPathQuerying]       = useState(false);
+  const [pathResult,     setPathResult]         = useState<PathResponse | null>(null);
+  const [pathNodes,      setPathNodes]          = useState<Set<string>>(new Set());
+  const [pathEdgeKeys,   setPathEdgeKeys]       = useState<Set<string>>(new Set());
+
+  // Refs that mirror path state so the graph reducers can read the current
+  // highlight sets without taking new dependencies on them (refs are updated
+  // synchronously in a useEffect, but the reducers run inside Sigma's draw
+  // cycle which is detached from React's render flow).
+  const pathNodesRef  = useRef<Set<string>>(new Set());
+  const pathEdgesRef  = useRef<Set<string>>(new Set());
+  useEffect(() => { pathNodesRef.current = pathNodes; }, [pathNodes]);
+  useEffect(() => { pathEdgesRef.current = pathEdgeKeys; }, [pathEdgeKeys]);
 
   useEffect(() => { selCommRef.current = selectedComm; }, [selectedComm]);
   useEffect(() => { highlightedNodeRef.current = highlightedNode; }, [highlightedNode]);
@@ -484,6 +591,100 @@ export function GraphVisualization({
 
   const resetView = useCallback(() => {
     sigmaRef.current?.getCamera().animate({ x: 0, y: 0, ratio: 1, angle: 0 }, { duration: 400 });
+  }, []);
+
+  // Path-finding: query the backend and update the highlight sets.
+  // Backend returns ordered hops; we convert that to a node-id set + edge-key
+  // set so the reducers can light up just the path subgraph.
+  const runPathQuery = useCallback(async (fromValue: string, toValue: string, maxHops: number = 6) => {
+    if (!investigationId) return;
+    setPathQuerying(true);
+    setPathResult(null);
+    try {
+      const qs = new URLSearchParams({
+        from: fromValue,
+        to: toValue,
+        max_hops: String(maxHops),
+      });
+      const res = await fetch(
+        `/api/investigations/${encodeURIComponent(investigationId)}/graph/path?${qs.toString()}`,
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        setPathResult({
+          found: false,
+          path_length: null,
+          hops: [],
+          from_entity: null,
+          to_entity: null,
+          message: text || `HTTP ${res.status}`,
+          directed: false,
+        });
+        setPathNodes(new Set());
+        setPathEdgeKeys(new Set());
+        return;
+      }
+      const json: PathResponse = await res.json();
+      setPathResult(json);
+      if (json.found && json.hops && json.hops.length > 0) {
+        const nodes = new Set<string>();
+        const edges = new Set<string>();
+        for (let i = 0; i < json.hops.length; i++) {
+          nodes.add(json.hops[i].node_id);
+          if (i > 0) {
+            // Build the edge key the same way the graph builder did.
+            edges.add(`${json.hops[i - 1].node_id}__${json.hops[i].node_id}`);
+          }
+        }
+        setPathNodes(nodes);
+        setPathEdgeKeys(edges);
+        // Frame the camera on the midpoint of the path so the analyst sees it.
+        const g = graphRef.current;
+        const sigma = sigmaRef.current;
+        if (g && sigma) {
+          let sx = 0, sy = 0, cnt = 0;
+          for (const nid of nodes) {
+            if (!g.hasNode(nid)) continue;
+            const pos = g.getNodeAttribute(nid, "x") as number;
+            const posy = g.getNodeAttribute(nid, "y") as number;
+            if (typeof pos === "number" && typeof posy === "number") {
+              sx += pos; sy += posy; cnt++;
+            }
+          }
+          if (cnt > 0) {
+            sigma.getCamera().animate(
+              { x: sx / cnt, y: sy / cnt, ratio: 0.3 },
+              { duration: 600 },
+            );
+          }
+        }
+      } else {
+        setPathNodes(new Set());
+        setPathEdgeKeys(new Set());
+      }
+      sigmaRef.current?.refresh();
+    } catch (e) {
+      setPathResult({
+        found: false,
+        path_length: null,
+        hops: [],
+        from_entity: null,
+        to_entity: null,
+        message: e instanceof Error ? e.message : String(e),
+        directed: false,
+      });
+      setPathNodes(new Set());
+      setPathEdgeKeys(new Set());
+    } finally {
+      setPathQuerying(false);
+    }
+  }, [investigationId]);
+
+  const clearPath = useCallback(() => {
+    setPathResult(null);
+    setPathNodes(new Set());
+    setPathEdgeKeys(new Set());
+    sigmaRef.current?.refresh();
   }, []);
 
   const startLayout = useCallback(() => {
@@ -630,6 +831,25 @@ export function GraphVisualization({
         const sn = selNodeRef.current;
         const sc = selCommRef.current;
         const hn = highlightedNodeRef.current;
+        const pathNodes = pathNodesRef.current;
+
+        // Path-highlight takes precedence over every other visual state.
+        // A path is active whenever the node set is non-empty (the dialog
+        // shows the same set, so the reducer's behaviour is consistent with
+        // what the analyst sees in the panel).
+        if (pathNodes.size > 0) {
+          if (pathNodes.has(node)) {
+            res.size   = (attrs.origSize as number) * 2.0;
+            res.color  = "#ffffff";
+            res.zIndex = 20;
+          } else {
+            // Non-path nodes are dimmed (opacity via reduced colour).
+            res.color  = NODE_DIM;
+            res.size   = (attrs.origSize as number) * 0.45;
+            res.label  = "";
+          }
+          return res;
+        }
 
         // Pinned visual — amber tint when no active selection
         if (attrs.pinned && !sn && !sc && !hn) {
@@ -692,6 +912,25 @@ export function GraphVisualization({
 
         const sn = selNodeRef.current;
         const sc = selCommRef.current;
+        const pathEdges = pathEdgesRef.current;
+
+        // Path-highlight: bright yellow + thick for edges that lie on the
+        // current path; transparent otherwise.  Same precedence rule as the
+        // node reducer — path mode wins over selection/community focus.
+        if (pathEdges.size > 0) {
+          const src = g.source(edge);
+          const tgt = g.target(edge);
+          if (pathEdges.has(`${src}__${tgt}`) || pathEdges.has(`${tgt}__${src}`)) {
+            res.color = "#FACC15"; // bright yellow
+            res.size  = 4;
+            res.zIndex = 15;
+          } else {
+            res.color = "rgba(0,0,0,0)";
+            res.size  = 0;
+          }
+          return res;
+        }
+
         if (sn) {
           if (g.hasExtremity(edge, sn)) {
             res.color = EDGE_ACTIVE; res.size = 2; res.zIndex = 5;
@@ -1040,13 +1279,36 @@ export function GraphVisualization({
             { label: "Re-layout",   title: "Recalculate layout",             action: () => startLayout() },
             { label: "Show all",    title: "Unhide all hidden nodes",        action: showAll    },
             { label: "Unpin all",   title: "Release all pinned nodes",       action: unpinAll   },
+            {
+              label:      "Find Path",
+              title:      investigationId ? "Find shortest path between two entities" : "Path query requires an investigation id",
+              action:     () => setPathDialogOpen(true),
+              disabled:   !investigationId,
+              highlight:  true,
+            },
+            ...(pathResult?.found ? [{ label: "Clear Path", title: "Clear the highlighted path", action: clearPath, highlight: true }] : []),
           ].map((btn) => (
             <button
               key={btn.label}
               title={btn.title}
               onClick={btn.action}
-              className="flex h-6 items-center justify-center rounded border border-white/10 bg-[rgba(7,11,17,0.82)] px-2.5 backdrop-blur-sm hover:border-white/20 hover:text-white transition-all"
-              style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(200,220,240,0.75)", whiteSpace: "nowrap" }}
+              disabled={"disabled" in btn && btn.disabled}
+              className="flex h-6 items-center justify-center rounded border bg-[rgba(7,11,17,0.82)] px-2.5 backdrop-blur-sm transition-all"
+              style={{
+                fontFamily:    "'IBM Plex Mono', monospace",
+                fontSize:      9,
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                whiteSpace:    "nowrap",
+                color:         "highlight" in btn && btn.highlight
+                  ? "#FACC15"
+                  : "rgba(200,220,240,0.75)",
+                borderColor:   "highlight" in btn && btn.highlight
+                  ? "rgba(250, 204, 21, 0.35)"
+                  : "rgba(255,255,255,0.10)",
+                opacity:       "disabled" in btn && btn.disabled ? 0.4 : 1,
+                cursor:        "disabled" in btn && btn.disabled ? "not-allowed" : "pointer",
+              }}
             >
               {btn.label}
             </button>
@@ -1270,6 +1532,331 @@ export function GraphVisualization({
         onClose={() => setSelectedNodeDetail(null)}
         onIsolateNeighbors={isolateNeighbors}
       />
+
+      {/* Find Path dialog */}
+      {pathDialogOpen && investigationId && (
+        <PathFindDialog
+          entities={data?.nodes ?? []}
+          querying={pathQuerying}
+          result={pathResult}
+          onClose={() => setPathDialogOpen(false)}
+          onSubmit={(from, to) => {
+            setPathDialogOpen(false);
+            void runPathQuery(from, to);
+          }}
+        />
+      )}
+
+      {/* Path result panel — appears below the graph when a path was found */}
+      {pathResult && (
+        <PathResultPanel
+          result={pathResult}
+          onClear={clearPath}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Path-finding dialog ─────────────────────────────────────────────────────
+
+interface PathFindDialogProps {
+  entities:   GraphNodeJSON[];
+  querying:   boolean;
+  result:     PathResponse | null;
+  onClose:    () => void;
+  onSubmit:   (from: string, to: string) => void;
+}
+
+function PathFindDialog({ entities, querying, result, onClose, onSubmit }: PathFindDialogProps) {
+  const [from, setFrom] = useState("");
+  const [to, setTo]     = useState("");
+  const [err, setErr]   = useState<string | null>(null);
+
+  const suggestions = useMemo(() => {
+    return entities
+      .map((n) => ({
+        id:      n.id,
+        label:   n.id,
+        type:    n.type,
+      }))
+      .filter((n) => n.id)
+      .sort((a, b) => a.label.localeCompare(b.label))
+      .slice(0, 200);
+  }, [entities]);
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!from.trim() || !to.trim()) {
+      setErr("Both From and To are required.");
+      return;
+    }
+    if (from.trim() === to.trim()) {
+      setErr("From and To must be different.");
+      return;
+    }
+    setErr(null);
+    onSubmit(from.trim(), to.trim());
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="absolute inset-0 z-50 flex items-center justify-center"
+      style={{ background: "rgba(0, 0, 0, 0.55)", backdropFilter: "blur(2px)" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <form
+        onSubmit={handleSubmit}
+        className="w-[480px] max-w-[90vw] rounded-lg"
+        style={{
+          background:   "rgba(8, 11, 17, 0.97)",
+          border:       "1px solid rgba(155, 159, 238, 0.30)",
+          boxShadow:    "0 12px 48px rgba(0,0,0,0.7)",
+          padding:      20,
+          color:        "#fff",
+          fontFamily:   "'IBM Plex Mono', monospace",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <span style={{ fontSize: 12, letterSpacing: "0.15em", textTransform: "uppercase", color: "#9B9FEE", fontWeight: 700 }}>
+            Find Shortest Path
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "rgba(255,255,255,0.5)",
+              cursor: "pointer",
+              fontSize: 18,
+              lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
+        </div>
+
+        <label style={{ display: "block", fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(200,220,240,0.7)", marginBottom: 6 }}>
+          From entity
+        </label>
+        <input
+          autoFocus
+          list="path-from-suggestions"
+          value={from}
+          onChange={(e) => setFrom(e.target.value)}
+          placeholder="e.g. LockBit"
+          disabled={querying}
+          style={inputStyle}
+        />
+        <datalist id="path-from-suggestions">
+          {suggestions.map((s) => (
+            <option key={`f-${s.id}`} value={s.label}>
+              {s.type ? ` — ${s.type}` : ""}
+            </option>
+          ))}
+        </datalist>
+
+        <label style={{ display: "block", fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(200,220,240,0.7)", margin: "14px 0 6px" }}>
+          To entity
+        </label>
+        <input
+          list="path-to-suggestions"
+          value={to}
+          onChange={(e) => setTo(e.target.value)}
+          placeholder="e.g. 185.220.101.45"
+          disabled={querying}
+          style={inputStyle}
+        />
+        <datalist id="path-to-suggestions">
+          {suggestions.map((s) => (
+            <option key={`t-${s.id}`} value={s.label}>
+              {s.type ? ` — ${s.type}` : ""}
+            </option>
+          ))}
+        </datalist>
+
+        {err && (
+          <div style={{ color: "#ef4444", fontSize: 11, marginTop: 10 }}>
+            {err}
+          </div>
+        )}
+
+        {result && !result.found && result.message && (
+          <div style={{ color: "#facc15", fontSize: 11, marginTop: 10 }}>
+            {result.message}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 18, justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={querying}
+            style={{
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.15)",
+              color: "rgba(255,255,255,0.7)",
+              padding: "6px 14px",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 11,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={querying}
+            style={{
+              background: "rgba(250, 204, 21, 0.18)",
+              border: "1px solid rgba(250, 204, 21, 0.45)",
+              color: "#FACC15",
+              padding: "6px 14px",
+              borderRadius: 4,
+              cursor: querying ? "wait" : "pointer",
+              fontSize: 11,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+              fontWeight: 700,
+              opacity: querying ? 0.6 : 1,
+            }}
+          >
+            {querying ? "Searching…" : "Find Path"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+const inputStyle: React.CSSProperties = {
+  width:        "100%",
+  background:   "rgba(0, 0, 0, 0.55)",
+  border:       "1px solid rgba(155, 159, 238, 0.25)",
+  borderRadius: 4,
+  color:        "#fff",
+  fontFamily:   "'IBM Plex Mono', monospace",
+  fontSize:     12,
+  padding:      "8px 10px",
+  outline:      "none",
+};
+
+// ─── Path result panel ───────────────────────────────────────────────────────
+
+function PathResultPanel({ result, onClear }: { result: PathResponse; onClear: () => void }) {
+  if (!result.found) {
+    return (
+      <div
+        className="absolute left-4 right-4 bottom-32 z-30 mx-auto"
+        style={{
+          maxWidth:    640,
+          background:  "rgba(8, 11, 17, 0.94)",
+          border:      "1px solid rgba(250, 204, 21, 0.35)",
+          borderRadius: 8,
+          padding:     "10px 14px",
+          color:       "#fff",
+          fontFamily:  "'IBM Plex Mono', monospace",
+          display:     "flex",
+          alignItems:  "center",
+          justifyContent: "space-between",
+          boxShadow:   "0 6px 24px rgba(0,0,0,0.55)",
+        }}
+      >
+        <span style={{ fontSize: 11, color: "#FACC15" }}>
+          ⚠ {result.message || "No path found"}
+        </span>
+        <button
+          onClick={onClear}
+          style={{
+            background:  "transparent",
+            border:      "1px solid rgba(255,255,255,0.18)",
+            color:       "rgba(255,255,255,0.75)",
+            padding:     "4px 10px",
+            borderRadius: 4,
+            cursor:      "pointer",
+            fontSize:    10,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+          }}
+        >
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="absolute left-4 right-4 bottom-32 z-30 mx-auto"
+      style={{
+        maxWidth:    720,
+        background:  "rgba(8, 11, 17, 0.96)",
+        border:      "1px solid rgba(250, 204, 21, 0.45)",
+        borderRadius: 10,
+        padding:     "12px 16px",
+        color:       "#fff",
+        fontFamily:  "'IBM Plex Mono', monospace",
+        boxShadow:   "0 10px 40px rgba(0,0,0,0.7)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontSize: 11, letterSpacing: "0.15em", textTransform: "uppercase", color: "#FACC15", fontWeight: 700 }}>
+          Shortest Path · {result.path_length ?? 0} hop{(result.path_length ?? 0) === 1 ? "" : "s"}
+          {result.directed === false ? " · undirected fallback" : ""}
+        </span>
+        <button
+          onClick={onClear}
+          style={{
+            background:  "transparent",
+            border:      "1px solid rgba(255,255,255,0.18)",
+            color:       "rgba(255,255,255,0.75)",
+            padding:     "4px 10px",
+            borderRadius: 4,
+            cursor:      "pointer",
+            fontSize:    10,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+          }}
+        >
+          Clear
+        </button>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {result.hops.map((hop, idx) => (
+          <div key={`${hop.node_id}-${idx}`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{
+              display: "inline-block",
+              width: 22, height: 22, lineHeight: "22px",
+              borderRadius: "50%",
+              background: "rgba(250, 204, 21, 0.22)",
+              color: "#FACC15",
+              textAlign: "center",
+              fontSize: 10, fontWeight: 700,
+              border: "1px solid rgba(250, 204, 21, 0.55)",
+              flexShrink: 0,
+            }}>
+              {idx + 1}
+            </span>
+            <span style={{ color: "#fff", fontSize: 12 }}>
+              {hop.canonical_value}
+            </span>
+            <span style={{ color: "rgba(200,220,240,0.5)", fontSize: 10 }}>
+              [{hop.entity_type || "?"}] conf {hop.confidence.toFixed(2)}
+            </span>
+            {idx < result.hops.length - 1 && hop.relationship_to_previous && (
+              <span style={{ color: "rgba(200,220,240,0.85)", fontSize: 11, marginLeft: 8 }}>
+                ↓ {hop.relationship_to_previous.type || "RELATED"} ({hop.relationship_to_previous.confidence.toFixed(2)})
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

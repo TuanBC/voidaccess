@@ -95,6 +95,14 @@ export type GraphEdgeJSON = {
 export type InvestigationGraphResponse = {
   nodes: GraphNodeJSON[];
   edges: GraphEdgeJSON[];
+  /**
+   * Server-computed community partition: node_id → community_id (int).
+   * Communities are computed once on the backend via greedy modularity
+   * (networkx.greedy_modularity_communities) and returned in every render,
+   * so the visualisation is deterministic and never blocks the browser.
+   */
+  communities?: Record<string, number>;
+  community_count?: number;
 };
 
 export type GraphApiResponse = InvestigationGraphResponse & {

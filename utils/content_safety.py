@@ -72,6 +72,47 @@ ENTITY_VALUE_BLOCKLIST: list[str] = [
     "child", "minor",
 ]
 
+
+# Common-password substring patterns — anything matching one of these as
+# a *value* (case-insensitive) is treated as a known weak password and
+# must never be stored as an entity.  These are deliberately not in the
+# main ENTITY_VALUE_BLOCKLIST because that list is only checked against
+# text-based entity types (ORG/handle/person/malware).  Passwords can
+# only appear as raw stealer-log values, which we now also filter via
+# ``_looks_like_common_password`` below.
+COMMON_PASSWORD_SUBSTRINGS: tuple[str, ...] = (
+    "password", "passwd", "p@ssw0rd", "p@ssword",
+    "123456", "12345678", "123456789", "1234567890",
+    "qwerty", "qwertyuiop", "asdfgh", "zxcvbn",
+    "letmein", "welcome", "admin", "admin123", "admin1234",
+    "iloveyou", "monkey", "dragon", "sunshine",
+    "princess", "football", "baseball", "superman",
+    "trustno1", "starwars", "passw0rd",
+    "hunter2", "shadow", "master", "jordan",
+    "michael", "thomas", "robert", "george",
+    "charlie", "andrew", "matthew", "access",
+    "hello", "secret", "love", "freedom",
+)
+
+
+def _looks_like_common_password(value: str) -> bool:
+    """
+    Return True if *value* matches any COMMON_PASSWORD_SUBSTRINGS entry.
+
+    Used as a defensive guard for stealer-log password fields and for any
+    entity value the generic API_KEY extractor surfaces.  Never logs the
+    value — only the boolean outcome.
+    """
+    if not value:
+        return False
+    v = value.lower().strip()
+    if not v:
+        return False
+    for needle in COMMON_PASSWORD_SUBSTRINGS:
+        if needle in v:
+            return True
+    return False
+
 # Entity types where prohibited content can appear as names/labels.
 # Technical IOC types (hashes, IPs, CVEs, wallets, onion URLs) are
 # intentionally omitted — they cannot contain prohibited content.
@@ -118,13 +159,29 @@ def is_blocked_entity_value(entity_type: str, value: str) -> bool:
     ONION_URL, or wallet addresses \u2014 these cannot contain prohibited content
     by definition and are intentionally excluded.
 
+    Additional defensive check: any entity whose value looks like a
+    common-password substring (``hunter2``, ``password123``, etc.) is
+    always blocked, regardless of entity type.  This catches the case
+    where the generic API_KEY extractor picks up a weak password as an
+    ``api_key`` value, and the stealer-log path leaking a password into
+    a downstream column.
+
     The check is case-insensitive substring matching against
-    ENTITY_VALUE_BLOCKLIST.  The actual value is never logged.
+    ENTITY_VALUE_BLOCKLIST and COMMON_PASSWORD_SUBSTRINGS.  The actual
+    value is never logged.
     """
+    if not value:
+        return True  # empty values are blocked outright
+
+    # Layer 1: known common-password substring filter (applies to every type).
+    if _looks_like_common_password(value):
+        return True
+
+    # Layer 2: prohibited-content filter (only for text-based entity types).
     if entity_type not in _TEXT_ENTITY_TYPES:
         return False
 
-    value_lower = (value or "").lower()
+    value_lower = value.lower()
     for term in ENTITY_VALUE_BLOCKLIST:
         if term in value_lower:
             return True

@@ -6,6 +6,7 @@ GET  /investigations          — list recent investigations
 GET  /investigations/{id}     — get single investigation
 GET  /investigations/{id}/entities — list entities for investigation
 GET  /investigations/{id}/graph    — graph JSON for investigation
+GET  /investigations/{id}/graph/path — shortest path between two entities
 """
 
 from __future__ import annotations
@@ -69,7 +70,405 @@ _infra_cluster_cache: dict[str, list] = {}
 
 # In-process cache: investigation_id (str) → sources_used status dict.
 # Populated during the pipeline run; read by the GET detail endpoint.
+# Phase 6.1: this is now a *fast-path* cache — the DB metadata column is
+# the source of truth so values survive container restarts.
 _sources_used_cache: dict[str, dict] = {}
+
+
+def _set_sources_used(investigation_id: str, sources_used: dict) -> None:
+    """Update in-memory cache AND persist to DB metadata (Phase 6.1).
+
+    Both writes happen on every call so the GET detail endpoint can serve
+    fresh values immediately after the pipeline updates them, while still
+    surviving a restart that drops the in-memory cache.
+    """
+    _sources_used_cache[investigation_id] = sources_used
+    _update_investigation_metadata(
+        investigation_id,
+        {"sources_used": sources_used},
+    )
+
+
+def _set_infra_clusters(investigation_id: str, clusters: list) -> None:
+    """Update in-memory cache AND persist to DB metadata (Phase 6.1)."""
+    _infra_cluster_cache[investigation_id] = clusters
+    _update_investigation_metadata(
+        investigation_id,
+        {"infrastructure_clusters": clusters},
+    )
+
+# ---------------------------------------------------------------------------
+# Phase 6.2 — per-phase timeouts (Phase 6.1: caches also persisted to DB)
+# ---------------------------------------------------------------------------
+# Defaults are conservative ceilings for a healthy investigation; an unhealthy
+# network or hung downstream service hits the timeout and we keep moving with
+# partial results.  All values are env-var-overridable — see _phase_timeout()
+# below — so ops can loosen the cap on a slow host without code changes.
+_PHASE_TIMEOUT_DEFAULTS = {
+    "parallel_sources": 300,  # already exists upstream; tracked here for symmetry
+    "enrichment": 120,
+    "graph_build": 60,
+    "summary": 90,
+    "finalize": 30,
+}
+
+_PHASE_TIMEOUT_ENV_VARS = {
+    "parallel_sources": "VOIDACCESS_PARALLEL_SOURCES_TIMEOUT",
+    "enrichment": "VOIDACCESS_ENRICHMENT_TIMEOUT",
+    "graph_build": "VOIDACCESS_GRAPH_TIMEOUT",
+    "summary": "VOIDACCESS_SUMMARY_TIMEOUT",
+    "finalize": "VOIDACCESS_FINALIZE_TIMEOUT",
+}
+
+
+def _phase_timeout(name: str) -> int:
+    """Return the configured timeout for a phase, falling back to the default.
+
+    Read at *call* time so tests / runtime overrides via env var work without
+    a module reload.  Invalid values silently fall back to the default so a
+    typo (``"120s"`` instead of ``"120"``) never wedges the pipeline.
+    """
+    default = _PHASE_TIMEOUT_DEFAULTS.get(name, 60)
+    env_var = _PHASE_TIMEOUT_ENV_VARS.get(name)
+    if env_var:
+        raw = os.getenv(env_var)
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                logger.warning(
+                    "[phase-timeout] Invalid %s=%r — using default %ds",
+                    env_var, raw, default,
+                )
+    return default
+
+
+# Snapshot evaluated at module import.  Modules that need a live value
+# (after a runtime env override) should call _phase_timeout() directly.
+PHASE_TIMEOUTS: dict[str, int] = {
+    name: _phase_timeout(name) for name in _PHASE_TIMEOUT_DEFAULTS
+}
+
+
+async def _run_with_timeout(coro, timeout_seconds: int, phase_name: str, investigation_id: str):
+    """Run *coro* with a hard timeout.
+
+    On timeout: logs a warning and returns ``None``.  Never raises
+    ``TimeoutError`` to the caller — the pipeline must always be able to
+    continue with partial results.  Non-timeout exceptions still propagate
+    so genuine bugs surface in normal error handling.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[%s] Phase '%s' timed out after %ds — continuing with partial results",
+            investigation_id, phase_name, timeout_seconds,
+        )
+        return None
+
+
+async def _run_enrichment_phase(
+    extraction_results,
+    inv_uuid,
+    investigation_id,
+    sources_used,
+):
+    """Post-extraction enrichment cluster (Steps 6.1, 6.2, 6.3, 6.4, 6.8).
+
+    Each sub-step keeps its own per-step ``asyncio.wait_for`` as a
+    defence-in-depth cap.  The outer cap (applied by the caller via
+    :func:`_run_with_timeout` with ``PHASE_TIMEOUTS["enrichment"]``) is the
+    final safety net if all sub-timeouts fire.
+
+    Returns ``(extraction_results, sources_used)`` — both possibly updated.
+    """
+    # ===== STEP 6.1: IP Reputation Enrichment =====
+    try:
+        from sources.ip_reputation import enrich_ip_entities as _enrich_ips
+
+        extraction_results, _ip_stats = await asyncio.wait_for(
+            _enrich_ips(extraction_results, inv_uuid),
+            timeout=60,
+        )
+        sources_used["ip_reputation"] = _ip_stats.get("ip_reputation", "ok_0_ips")
+        _set_sources_used(investigation_id, sources_used)
+        logger.info(
+            "[%s] IP reputation: %d checked, %d suppressed, %d C2 confirmed, %d abuse",
+            inv_uuid,
+            _ip_stats.get("checked", 0),
+            _ip_stats.get("suppressed", 0),
+            _ip_stats.get("c2_confirmed", 0),
+            _ip_stats.get("abuse_confirmed", 0),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[%s] IP reputation enrichment timed out after 60s", inv_uuid)
+        sources_used["ip_reputation"] = "error_timeout"
+        _set_sources_used(investigation_id, sources_used)
+    except Exception as _ip_exc:
+        logger.info("[%s] IP reputation enrichment failed (non-fatal): %s", inv_uuid, _ip_exc)
+        sources_used["ip_reputation"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+
+    # ===== STEP 6.8: DNS/WHOIS Enrichment =====
+    try:
+        from sources.enrichment import run_dns_enrichment
+
+        extracted_entities_for_dns: list = []
+        for _r in extraction_results:
+            for _e in getattr(_r, "entities", []):
+                if hasattr(_e, "entity_type"):
+                    extracted_entities_for_dns.append({
+                        "entity_type": _e.entity_type,
+                        "canonical_value": _e.value,
+                        "value": _e.value,
+                        "confidence": _e.confidence,
+                    })
+                elif isinstance(_e, dict):
+                    extracted_entities_for_dns.append(_e)
+
+        dns_results = await asyncio.wait_for(
+            run_dns_enrichment(extracted_entities_for_dns),
+            timeout=120,
+        )
+        new_dns_entities = dns_results.get("new_entities", [])
+        if new_dns_entities:
+            logger.info(
+                "[%s] DNS enrichment: %d new entities discovered",
+                inv_uuid, len(new_dns_entities),
+            )
+        clusters = dns_results.get("infrastructure_clusters", [])
+        if clusters:
+            logger.info("[%s] Infrastructure clusters found: %d", inv_uuid, len(clusters))
+            for cluster in clusters:
+                logger.info("[%s]   %s", inv_uuid, cluster["description"])
+            _set_infra_clusters(investigation_id, clusters)
+        _dns_ent_count = len(new_dns_entities)
+        sources_used["circl_pdns"] = (
+            f"ok_{_dns_ent_count}_enrichments" if _dns_ent_count > 0 else "ok_0_enrichments"
+        )
+        _set_sources_used(investigation_id, sources_used)
+    except asyncio.TimeoutError:
+        logger.warning("[%s] DNS enrichment timed out after 120s", inv_uuid)
+        sources_used["circl_pdns"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+    except Exception as _dns_exc:
+        logger.info("[%s] DNS enrichment failed (non-fatal): %s", inv_uuid, _dns_exc)
+        sources_used["circl_pdns"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+
+    # ===== STEP 6.2: Domain Reputation Enrichment =====
+    try:
+        from sources.domain_reputation import enrich_domain_entities as _enrich_domains
+
+        extraction_results, _dom_stats = await asyncio.wait_for(
+            _enrich_domains(extraction_results, inv_uuid),
+            timeout=120,
+        )
+        sources_used["domain_reputation"] = _dom_stats.get(
+            "domain_reputation", "ok_0_domains"
+        )
+        _set_sources_used(investigation_id, sources_used)
+        logger.info(
+            "[%s] Domain reputation: %d domains, %d CT records, %d malicious, %d archived",
+            inv_uuid,
+            _dom_stats.get("domains_checked", 0),
+            _dom_stats.get("ct_records", 0),
+            _dom_stats.get("urlscan_malicious", 0),
+            _dom_stats.get("wayback_archived", 0),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[%s] Domain reputation enrichment timed out after 120s", inv_uuid)
+        sources_used["domain_reputation"] = "error_timeout"
+        _set_sources_used(investigation_id, sources_used)
+    except Exception as _dom_exc:
+        logger.info("[%s] Domain reputation enrichment failed (non-fatal): %s", inv_uuid, _dom_exc)
+        sources_used["domain_reputation"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+
+    # ===== STEP 6.3: Hash Reputation Enrichment =====
+    try:
+        from sources.hash_reputation import enrich_hash_entities as _enrich_hashes
+
+        extraction_results, _hash_stats = await asyncio.wait_for(
+            _enrich_hashes(extraction_results, inv_uuid),
+            timeout=90,
+        )
+        sources_used["hash_reputation"] = _hash_stats.get("hash_reputation", "ok_0_hashes")
+        _set_sources_used(investigation_id, sources_used)
+        logger.info(
+            "[%s] Hash reputation: %d checked, %d malicious, %d suspicious, "
+            "%d families, %d new entities",
+            inv_uuid,
+            _hash_stats.get("hashes_checked", 0),
+            _hash_stats.get("malicious", 0),
+            _hash_stats.get("suspicious", 0),
+            _hash_stats.get("malware_families_found", 0),
+            _hash_stats.get("new_entities_discovered", 0),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[%s] Hash reputation enrichment timed out after 90s", inv_uuid)
+        sources_used["hash_reputation"] = "error_timeout"
+        _set_sources_used(investigation_id, sources_used)
+    except Exception as _hash_exc:
+        logger.info("[%s] Hash reputation enrichment failed (non-fatal): %s", inv_uuid, _hash_exc)
+        sources_used["hash_reputation"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+
+    # ===== STEP 6.4: Email Reputation Enrichment =====
+    try:
+        from sources.email_reputation import enrich_email_entities as _enrich_emails
+
+        extraction_results, _email_stats = await asyncio.wait_for(
+            _enrich_emails(extraction_results, inv_uuid),
+            timeout=60,
+        )
+        sources_used["email_reputation"] = _email_stats.get(
+            "email_reputation", "ok_0_emails"
+        )
+        _set_sources_used(investigation_id, sources_used)
+        logger.info(
+            "[%s] Email reputation: %d checked, %d breached, %d passwords exposed, "
+            "%d disposable, %d malicious",
+            inv_uuid,
+            _email_stats.get("emails_checked", 0),
+            _email_stats.get("breached", 0),
+            _email_stats.get("password_exposed", 0),
+            _email_stats.get("disposable", 0),
+            _email_stats.get("malicious", 0),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[%s] Email reputation enrichment timed out after 60s", inv_uuid)
+        sources_used["email_reputation"] = "error_timeout"
+        _set_sources_used(investigation_id, sources_used)
+    except Exception as _email_exc:
+        logger.info("[%s] Email reputation enrichment failed (non-fatal): %s", inv_uuid, _email_exc)
+        sources_used["email_reputation"] = "error"
+        _set_sources_used(investigation_id, sources_used)
+
+    return extraction_results, sources_used
+
+
+async def _build_graph_phase(
+    extraction_results, inv_uuid, investigation_id
+):
+    """Phase 6.2 wrapper around STEP 7 (graph building).
+
+    Capped by the caller via ``_run_with_timeout`` with
+    ``PHASE_TIMEOUTS["graph_build"]``.  Returns ``None`` on internal error
+    so the caller can decide to fall back gracefully.
+    """
+    try:
+        from graph.builder import build_graph_from_db, persist_graph_edges
+        from db.session import get_session
+        from db.models import Investigation
+
+        graph_obj = await asyncio.to_thread(
+            build_graph_from_db, investigation_id=inv_uuid
+        )
+        node_count = len(graph_obj.nodes())
+        edge_count = len(graph_obj.edges())
+        logger.info(
+            "[%s] Graph: %s nodes, %s edges",
+            inv_uuid, node_count, edge_count,
+        )
+
+        try:
+            persist_result = await asyncio.to_thread(
+                _persist_graph_edges_sync, graph_obj, inv_uuid
+            )
+            graph_status = persist_result.get("status", "written")
+            edges_written = persist_result.get("edges_written", 0)
+            logger.info(
+                "[%s] Graph edges persisted: %s (%s)",
+                inv_uuid, edges_written, graph_status,
+            )
+            new_graph_status = (
+                "skipped_overflow" if graph_status == "skipped_overflow" else "built"
+            )
+            with get_session() as session:
+                session.query(Investigation).filter_by(id=inv_uuid).update(
+                    {"graph_status": new_graph_status}
+                )
+                session.commit()
+        except Exception as e:
+            logger.info("[%s] Edge persistence failed (non-fatal): %s", inv_uuid, e)
+    except Exception as exc:
+        logger.exception("[%s] Graph building failed: %s", inv_uuid, str(exc))
+        return None
+    return True
+
+
+async def _generate_summary_phase(
+    extraction_results,
+    page_records,
+    refined_query,
+    llm_client,
+    inv_uuid,
+    investigation_id,
+    scraped_count,
+    total_entities,
+):
+    """Phase 6.2 wrapper around STEP 8 (LLM summary).
+
+    Capped by the caller via ``_run_with_timeout`` with
+    ``PHASE_TIMEOUTS["summary"]``.  Falls back to a placeholder string if
+    the LLM is unavailable or any error occurs so the pipeline always
+    reaches the finalize step with *some* summary.
+    """
+    if llm_client is None:
+        return (
+            f"Investigation completed without LLM summary. "
+            f"Scraped {scraped_count} pages; extracted {total_entities} entities."
+        )
+    try:
+        from voidaccess.llm import generate_summary
+
+        summary_entities = []
+        if extraction_results:
+            for result in extraction_results:
+                summary_entities.extend(result.entities)
+
+        summary = await _llm_with_backoff(
+            generate_summary,
+            llm=llm_client,
+            query=refined_query,
+            content=page_records,
+            entities=summary_entities if summary_entities else None,
+            investigation_id=inv_uuid,
+        )
+        logger.info("[%s] Summary generated (%d chars)", inv_uuid, len(summary or ""))
+        return summary
+    except Exception as exc:
+        logger.exception("[%s] Summary generation failed, using fallback summary: %s", inv_uuid, exc)
+        return (
+            f"Investigation complete for '{refined_query}'. "
+            f"Analysis pipeline completed successfully, but summary generation failed: {exc}."
+        )
+
+
+async def _finalize_phase(inv_uuid, summary):
+    """Phase 6.2 wrapper around STEP 9 (DB finalize).
+
+    Capped by the caller via ``_run_with_timeout`` with
+    ``PHASE_TIMEOUTS["finalize"]``.  Returns ``True`` on success, ``False``
+    if the DB write failed (caller decides whether to log/continue).
+    """
+    try:
+        from db.session import get_session
+        from db.queries import update_investigation_summary
+        from db.models import Investigation
+
+        with get_session() as session:
+            update_investigation_summary(session, inv_uuid, summary)
+            session.query(Investigation).filter_by(id=inv_uuid).update(
+                {"status": "completed"}
+            )
+            session.commit()
+        return True
+    except Exception as exc:
+        logger.warning("[%s] Finalize phase failed (non-fatal): %s", inv_uuid, exc)
+        return False
 
 # Cooperative cancellation flags: investigation_id (str) → True when cancel requested.
 # Checked at pipeline checkpoints; cleared once the pipeline honours the request.
@@ -140,6 +539,11 @@ STEP_LABELS = {
     9: "Finalizing results",
 }
 
+# Static fallback label for the LLM extraction tier.  The live SSE
+# progress event includes a dynamic "page N/M" suffix — see
+# `_llm_extraction_progress` in `_run_investigation_task`.
+LLM_EXTRACTION_LABEL = "Extracting entities (LLM tier)"
+
 
 # ---------------------------------------------------------------------------
 # Request / response schemas
@@ -163,6 +567,25 @@ class InvestigationRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helper: load investigation from DB
 # ---------------------------------------------------------------------------
+
+
+def _count_discovered_seeds_for_investigation(investigation_id_str: str) -> int:
+    """
+    Count discovered .onion seeds attributed to a given investigation.
+    Reads from SeedManager._seeds in memory — same source the admin
+    endpoint surfaces, no extra DB query needed.
+    """
+    try:
+        seed_manager = get_seed_manager()
+        return sum(
+            1
+            for s in seed_manager.list_seeds()
+            if s.get("category") == "discovered"
+            and s.get("investigation_id") == investigation_id_str
+        )
+    except Exception as exc:
+        logger.debug("_count_discovered_seeds_for_investigation failed: %s", exc)
+        return 0
 
 
 def _count_paste_pages_for_investigation(session, internal_id) -> tuple[int, list[str]]:
@@ -258,6 +681,32 @@ def _get_db_investigation(investigation_id: str) -> Any:
                 .scalar()
                 or 0
             )
+
+            # Phase 6.1 — sources_used / infrastructure_clusters from DB metadata.
+            # The in-memory cache is the fast path; the DB column is the source
+            # of truth so values survive a container restart.
+            db_metadata = getattr(inv, "metadata_json", None) or {}
+            if not isinstance(db_metadata, dict):
+                # SQLite legacy may return a JSON string; normalize.
+                try:
+                    db_metadata = json.loads(db_metadata) if db_metadata else {}
+                except (ValueError, TypeError):
+                    db_metadata = {}
+
+            db_sources_used = db_metadata.get("sources_used") or {}
+            db_infra_clusters = db_metadata.get("infrastructure_clusters") or []
+
+            sources_used = (
+                _sources_used_cache.get(str(inv.id))
+                or _sources_used_cache.get(investigation_id)
+                or db_sources_used
+            )
+            infrastructure_clusters = (
+                _infra_cluster_cache.get(str(inv.id))
+                or _infra_cluster_cache.get(investigation_id)
+                or db_infra_clusters
+            )
+
             return {
                 "id": str(inv.id),
                 "run_id": str(inv.run_id),
@@ -278,8 +727,9 @@ def _get_db_investigation(investigation_id: str) -> Any:
                 "pages_crawled": pages_crawled,  # keep for compat
                 "paste_pages_found": paste_pages_found,
                 "paste_sources_used": paste_sources_used,
-                "infrastructure_clusters": _infra_cluster_cache.get(investigation_id, _infra_cluster_cache.get(str(inv.id), [])),
-                "sources_used": _sources_used_cache.get(str(inv.id), _sources_used_cache.get(investigation_id, {})),
+                "infrastructure_clusters": infrastructure_clusters,
+                "sources_used": sources_used,
+                "seeds_discovered": _count_discovered_seeds_for_investigation(str(inv.id)),
             }
     except HTTPException:
         raise
@@ -311,6 +761,76 @@ async def _update_investigation_status(
             updates["summary"] = summary
         session.query(Investigation).filter_by(id=investigation_id).update(updates)
         session.commit()
+
+
+def _update_investigation_metadata(
+    investigation_id: "uuid.UUID | str",
+    patch: dict[str, Any],
+    session=None,
+) -> bool:
+    """Shallow-merge *patch* into ``investigations.metadata`` (JSON column).
+
+    Used by Phase 6.1 to persist in-process pipeline caches (sources_used,
+    infrastructure_clusters) so the GET detail endpoint can serve them after
+    a container restart.  Accepts an optional *session* for batch callers
+    that already hold one open; opens its own short-lived session otherwise.
+
+    Returns ``True`` if the row was updated, ``False`` otherwise (no DB
+    configured, row missing, or DB error).  Never raises — failures are
+    logged at warning so a transient DB hiccup never kills the pipeline.
+    """
+    if not os.getenv("DATABASE_URL"):
+        return False
+    try:
+        from db.session import get_session
+        from db.models import Investigation
+        import json as _json
+
+        inv_uuid = (
+            investigation_id
+            if isinstance(investigation_id, uuid.UUID)
+            else uuid.UUID(str(investigation_id))
+        )
+
+        def _merge(_session) -> bool:
+            inv = _session.query(Investigation).filter_by(id=inv_uuid).first()
+            if inv is None:
+                return False
+            current = inv.metadata_json
+            # SQLite + JSON column round-trip may return a JSON string; always
+            # normalize to a dict so the merge below is uniform.
+            if current is None:
+                merged: dict[str, Any] = {}
+            elif isinstance(current, dict):
+                merged = dict(current)
+            elif isinstance(current, str):
+                try:
+                    merged = _json.loads(current) if current.strip() else {}
+                except (ValueError, TypeError):
+                    merged = {}
+            else:
+                merged = {}
+            merged.update(patch)
+            # SQLAlchemy's JSON column detects mutations on dict instances
+            # via the ORM change-tracking events; explicit assignment keeps
+            # the change visible to the session even if the type was loaded
+            # as a string (SQLite legacy).
+            inv.metadata_json = merged
+            return True
+
+        if session is not None:
+            return _merge(session)
+        with get_session() as s:
+            ok = _merge(s)
+            if ok:
+                s.commit()
+            return ok
+    except Exception as exc:
+        logger.warning(
+            "[%s] _update_investigation_metadata failed (non-fatal): %s",
+            investigation_id, exc,
+        )
+        return False
 
 
 async def _update_progress(
@@ -562,7 +1082,7 @@ async def _run_investigation_task(
                 search_query = q.replace(" ", "+")
                 logger.info("[%s] Searching [%s]: %s...", inv_uuid, lang_code, search_query[:60])
                 try:
-                    engine_results = await _search_engines_async(search_query)
+                    engine_results = await _search_engines_async(search_query, llm_client=llm_client)
                     all_links: list[dict] = []
                     for er in engine_results:
                         weight = 0.5
@@ -1000,6 +1520,10 @@ async def _run_investigation_task(
         sources_used["hash_reputation"] = "pending"
         sources_used["email_reputation"] = "pending"
         _sources_used_cache[investigation_id] = sources_used
+        _update_investigation_metadata(
+            investigation_id,
+            {"sources_used": sources_used},
+        )
         # ── end sources_used ──────────────────────────────────────────────────
 
         if len(search_urls) < 2:
@@ -1113,7 +1637,11 @@ async def _run_investigation_task(
             len(uncached_url_dicts),
             len(cached_dict),
         )
-        freshly_scraped = await scrape_multiple(uncached_url_dicts, max_workers=12)
+        freshly_scraped = await scrape_multiple(
+            uncached_url_dicts,
+            max_workers=12,
+            investigation_id=str(inv_uuid),
+        )
         await _update_progress(inv_uuid, 4, scraped_pages=freshly_scraped)
         if await _check_cancelled(inv_uuid, investigation_id):
             return
@@ -1337,12 +1865,45 @@ async def _run_investigation_task(
         # ===== STEP 6: Entity extraction (no session held) =====
         logger.info("[%s] STEP 6: Extracting entities...", inv_uuid)
         extraction_input = non_empty_records if non_empty_records else page_records
+
+        # Cap LLM-extraction pages per investigation.  Default 10 — enough
+        # to cover the highest-value pages without burning the full
+        # 45-66 LLM calls per investigation.  Override via env var.
+        try:
+            max_llm_pages = int(os.getenv("MAX_LLM_PAGES_PER_INV", "10") or 10)
+        except ValueError:
+            max_llm_pages = 10
+
+        # Reuse the already-initialised llm_client.  When no client is
+        # available the pipeline's internal `if run_llm_extraction and
+        # llm is not None` guard keeps extraction at the regex+NER tier
+        # (graceful degradation — see pipeline.py:129 and :254).
+        run_llm_extraction = llm_client is not None
+
+        async def _llm_extraction_progress(
+            current: int,
+            total: int,
+            url: str,
+        ) -> None:
+            """SSE label update after each LLM-tier page completes."""
+            label = f"Extracting entities (LLM tier — page {current}/{total})"
+            logger.info(
+                "[%s] LLM extraction progress: %d/%d — %s",
+                inv_uuid, current, total, url,
+            )
+            try:
+                await _update_progress(inv_uuid, label=label)
+            except Exception as exc:
+                logger.debug("LLM progress update failed (non-fatal): %s", exc)
+
         try:
             extraction_results = await extract_entities_from_pages(
                 extraction_input,
                 investigation_id=inv_uuid,
                 llm=llm_client,
-                run_llm_extraction=True,
+                run_llm_extraction=run_llm_extraction,
+                max_llm_pages=max_llm_pages,
+                llm_progress_callback=_llm_extraction_progress,
             )
             total_entities = sum(r.entity_count for r in extraction_results)
             logger.info("[%s] Extracted %s entities", inv_uuid, total_entities)
@@ -1362,36 +1923,29 @@ async def _run_investigation_task(
         if await _check_cancelled(inv_uuid, investigation_id):
             return
 
-        # ===== STEP 6.1: IP Reputation Enrichment =====
-        # Runs after entities are in DB but before the entity cap is applied.
-        # Suppresses GreyNoise-benign IPs and boosts confidence for confirmed C2s.
-        logger.info("[%s] STEP 6.1: Running IP reputation enrichment...", inv_uuid)
-        try:
-            from sources.ip_reputation import enrich_ip_entities as _enrich_ips
-
-            extraction_results, _ip_stats = await asyncio.wait_for(
-                _enrich_ips(extraction_results, inv_uuid),
-                timeout=60,
+        # ===== Phase 6.2: Wrapped enrichment cluster =====
+        # Steps 6.1, 6.8, 6.2, 6.3, 6.4 are all reputation enrichment with
+        # per-step timeouts.  The outer _run_with_timeout cap is the final
+        # safety net if every sub-timeout fires.  Returns updated state.
+        enrichment_result = await _run_with_timeout(
+            _run_enrichment_phase(
+                extraction_results, inv_uuid, investigation_id, sources_used,
+            ),
+            PHASE_TIMEOUTS["enrichment"],
+            "enrichment",
+            investigation_id,
+        )
+        if enrichment_result is None:
+            logger.warning(
+                "[%s] Enrichment phase hit %ds cap — continuing with partial results",
+                inv_uuid, PHASE_TIMEOUTS["enrichment"],
             )
-            total_entities = sum(r.entity_count for r in extraction_results)
-            sources_used["ip_reputation"] = _ip_stats.get("ip_reputation", "ok_0_ips")
-            _sources_used_cache[investigation_id] = sources_used
-            logger.info(
-                "[%s] IP reputation: %d checked, %d suppressed, %d C2 confirmed, %d abuse",
-                inv_uuid,
-                _ip_stats.get("checked", 0),
-                _ip_stats.get("suppressed", 0),
-                _ip_stats.get("c2_confirmed", 0),
-                _ip_stats.get("abuse_confirmed", 0),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[%s] IP reputation enrichment timed out after 60s", inv_uuid)
-            sources_used["ip_reputation"] = "error_timeout"
-            _sources_used_cache[investigation_id] = sources_used
-        except Exception as _ip_exc:
-            logger.info("[%s] IP reputation enrichment failed (non-fatal): %s", inv_uuid, _ip_exc)
-            sources_used["ip_reputation"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
+        else:
+            extraction_results, sources_used = enrichment_result
+            try:
+                total_entities = sum(r.entity_count for r in extraction_results)
+            except Exception:
+                pass
 
         # ===== STEP 6.5: Cross-reference against seed data (short-lived session) =====
         logger.info("[%s] STEP 6.5: Cross-referencing with historical data...", inv_uuid)
@@ -1439,262 +1993,115 @@ async def _run_investigation_task(
 
         await _update_progress(inv_uuid, 6)
 
-        # ===== STEP 6.8: DNS/WHOIS Enrichment (no session held) =====
-        logger.info("[%s] STEP 6.8: Running DNS/WHOIS enrichment...", inv_uuid)
+        # ===== STEP 6.9: Update persistent actor profiles (non-blocking) =====
+        # Aggregate the investigation's THREAT_ACTOR_HANDLE / RANSOMWARE_GROUP
+        # entities into the long-lived actor_profiles table.  Fire-and-forget
+        # so a slow DB write never stalls the pipeline; errors are logged at
+        # WARNING and never propagated.
         try:
-            from sources.enrichment import run_dns_enrichment
-
-            # Build a flat list of entity dicts from extraction results for DNS lookup.
-            # NormalizedEntity dataclasses are converted to the dict format expected by
-            # enrich_with_dns (entity_type + canonical_value/value).
-            extracted_entities_for_dns: list[dict] = []
+            actor_entities: list = []
             for _r in extraction_results:
-                for _e in getattr(_r, "entities", []):
-                    if hasattr(_e, "entity_type"):
-                        extracted_entities_for_dns.append({
-                            "entity_type": _e.entity_type,
-                            "canonical_value": _e.value,
-                            "value": _e.value,
-                            "confidence": _e.confidence,
-                        })
-                    elif isinstance(_e, dict):
-                        extracted_entities_for_dns.append(_e)
-
-            dns_results = await asyncio.wait_for(
-                run_dns_enrichment(extracted_entities_for_dns),
-                timeout=120,
-            )
-
-            new_dns_entities = dns_results.get("new_entities", [])
-            if new_dns_entities:
+                actor_entities.extend(getattr(_r, "entities", []) or [])
+            if actor_entities:
+                _ap_task = asyncio.create_task(
+                    _update_actor_profiles(actor_entities, inv_uuid),
+                    name=f"actor-profiles-{inv_uuid}",
+                )
+                # Best-effort: we don't await the task here, but we make sure
+                # any exception (other than CancelledError) is observed.
+                def _log_actor_task_result(t: "asyncio.Task") -> None:
+                    try:
+                        t.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Actor profile update task raised (non-fatal): %s",
+                            inv_uuid,
+                            exc,
+                        )
+                _ap_task.add_done_callback(_log_actor_task_result)
                 logger.info(
-                    "[%s] DNS enrichment: %d new entities discovered",
+                    "[%s] Actor profile update scheduled (%d entities, non-blocking)",
                     inv_uuid,
-                    len(new_dns_entities),
+                    len(actor_entities),
                 )
-
-            clusters = dns_results.get("infrastructure_clusters", [])
-            if clusters:
-                logger.info(
-                    "[%s] Infrastructure clusters found: %d",
-                    inv_uuid,
-                    len(clusters),
-                )
-                for cluster in clusters:
-                    logger.info("[%s]   %s", inv_uuid, cluster["description"])
-                _infra_cluster_cache[investigation_id] = clusters
-
-            _dns_ent_count = len(new_dns_entities)
-            sources_used["circl_pdns"] = (
-                f"ok_{_dns_ent_count}_enrichments" if _dns_ent_count > 0 else "ok_0_enrichments"
+        except Exception as _ap_exc:
+            logger.info(
+                "[%s] Actor profile schedule failed (non-fatal): %s", inv_uuid, _ap_exc
             )
-            _sources_used_cache[investigation_id] = sources_used
 
-        except asyncio.TimeoutError:
-            logger.warning("[%s] DNS enrichment timed out after 120s", inv_uuid)
-            sources_used["circl_pdns"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
-        except Exception as _dns_exc:
-            logger.info("[%s] DNS enrichment failed (non-fatal): %s", inv_uuid, _dns_exc)
-            sources_used["circl_pdns"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
-
-        # ===== STEP 6.2: Domain Reputation Enrichment =====
-        # Runs after DNS enrichment. Enriches DOMAIN entities with:
-        #   crt.sh (subdomain enumeration via certificate transparency)
-        #   URLScan.io (live scan data, malicious indicators, communicating IPs)
-        #   Wayback Machine (historical snapshots for taken-down domains)
-        # Non-fatal: if all three sources fail for a domain, entity is unchanged.
-        logger.info("[%s] STEP 6.2: Running domain reputation enrichment...", inv_uuid)
+        # ===== STEP 6.91: Cross-alias resolution (non-blocking) =====
+        # After the actor profile rows are in place, run the cross-alias
+        # scoring pass to detect handle variants that share infrastructure,
+        # PGP keys, or string similarity.  Findings are persisted as
+        # ``likely_same_actor`` / ``confirmed_same_actor`` rows in
+        # ``actor_aliases`` (the analyst can override via the API).
+        # Scheduled as a separate task so the main pipeline never waits
+        # on alias resolution latency.
         try:
-            from sources.domain_reputation import enrich_domain_entities as _enrich_domains
-
-            extraction_results, _dom_stats = await asyncio.wait_for(
-                _enrich_domains(extraction_results, inv_uuid),
-                timeout=120,
+            _alias_task = asyncio.create_task(
+                _run_alias_resolution(inv_uuid),
+                name=f"alias-resolution-{inv_uuid}",
             )
-            sources_used["domain_reputation"] = _dom_stats.get(
-                "domain_reputation", "ok_0_domains"
-            )
-            _sources_used_cache[investigation_id] = sources_used
-            logger.info(
-                "[%s] Domain reputation: %d domains, %d CT records, %d malicious, %d archived",
-                inv_uuid,
-                _dom_stats.get("domains_checked", 0),
-                _dom_stats.get("ct_records", 0),
-                _dom_stats.get("urlscan_malicious", 0),
-                _dom_stats.get("wayback_archived", 0),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Domain reputation enrichment timed out after 120s", inv_uuid)
-            sources_used["domain_reputation"] = "error_timeout"
-            _sources_used_cache[investigation_id] = sources_used
-        except Exception as _dom_exc:
-            logger.info("[%s] Domain reputation enrichment failed (non-fatal): %s", inv_uuid, _dom_exc)
-            sources_used["domain_reputation"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
-
-        # ===== STEP 6.3: Hash Reputation Enrichment =====
-        # Runs after domain reputation. Enriches FILE_HASH_* entities with:
-        #   Hybrid Analysis (behavioral sandbox — requires HYBRID_ANALYSIS_API_KEY)
-        #   MalwareBazaar (family classification — free, no auth)
-        #   ThreatFox (IOC database — free, no auth)
-        #   VirusTotal extended (AV detections + sandbox IOCs — requires VT_API_KEY)
-        # Hashes are never suppressed. Non-fatal: 90s timeout.
-        logger.info("[%s] STEP 6.3: Running hash reputation enrichment...", inv_uuid)
-        try:
-            from sources.hash_reputation import enrich_hash_entities as _enrich_hashes
-
-            extraction_results, _hash_stats = await asyncio.wait_for(
-                _enrich_hashes(extraction_results, inv_uuid),
-                timeout=90,
-            )
-            sources_used["hash_reputation"] = _hash_stats.get("hash_reputation", "ok_0_hashes")
-            _sources_used_cache[investigation_id] = sources_used
-            logger.info(
-                "[%s] Hash reputation: %d checked, %d malicious, %d suspicious, "
-                "%d families, %d new entities",
-                inv_uuid,
-                _hash_stats.get("hashes_checked", 0),
-                _hash_stats.get("malicious", 0),
-                _hash_stats.get("suspicious", 0),
-                _hash_stats.get("malware_families_found", 0),
-                _hash_stats.get("new_entities_discovered", 0),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Hash reputation enrichment timed out after 90s", inv_uuid)
-            sources_used["hash_reputation"] = "error_timeout"
-            _sources_used_cache[investigation_id] = sources_used
-        except Exception as _hash_exc:
-            logger.info("[%s] Hash reputation enrichment failed (non-fatal): %s", inv_uuid, _hash_exc)
-            sources_used["hash_reputation"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
-
-        # ===== STEP 6.4: Email Reputation Enrichment =====
-        # Runs after hash reputation. Enriches EMAIL_ADDRESS entities with:
-        #   HIBP (breach history — requires HIBP_API_KEY, paid $3.50/mo)
-        #   EmailRep.io (reputation scoring — works without key)
-        #   Disposable domain blocklist (local check, no auth)
-        #   Domain cross-reference (custom email domains added as DOMAIN entities)
-        # Non-fatal: 60s timeout.
-        logger.info("[%s] STEP 6.4: Running email reputation enrichment...", inv_uuid)
-        try:
-            from sources.email_reputation import enrich_email_entities as _enrich_emails
-
-            extraction_results, _email_stats = await asyncio.wait_for(
-                _enrich_emails(extraction_results, inv_uuid),
-                timeout=60,
-            )
-            sources_used["email_reputation"] = _email_stats.get(
-                "email_reputation", "ok_0_emails"
-            )
-            _sources_used_cache[investigation_id] = sources_used
-            logger.info(
-                "[%s] Email reputation: %d checked, %d breached, %d passwords exposed, "
-                "%d disposable, %d malicious",
-                inv_uuid,
-                _email_stats.get("emails_checked", 0),
-                _email_stats.get("breached", 0),
-                _email_stats.get("password_exposed", 0),
-                _email_stats.get("disposable", 0),
-                _email_stats.get("malicious", 0),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Email reputation enrichment timed out after 60s", inv_uuid)
-            sources_used["email_reputation"] = "error_timeout"
-            _sources_used_cache[investigation_id] = sources_used
-        except Exception as _email_exc:
-            logger.info(
-                "[%s] Email reputation enrichment failed (non-fatal): %s", inv_uuid, _email_exc
-            )
-            sources_used["email_reputation"] = "error"
-            _sources_used_cache[investigation_id] = sources_used
-
-        # ===== STEP 7: Graph building (wrapped in to_thread with own session) =====
-        logger.info("[%s] STEP 7: Building graph...", inv_uuid)
-        try:
-            from graph.builder import build_graph_from_db, persist_graph_edges
-
-            graph_obj = await asyncio.to_thread(build_graph_from_db, investigation_id=inv_uuid)
-            node_count = len(graph_obj.nodes())
-            edge_count = len(graph_obj.edges())
-            logger.info(
-                "[%s] Graph: %s nodes, %s edges",
-                inv_uuid,
-                node_count,
-                edge_count,
-            )
-
-            try:
-                persist_result = await asyncio.to_thread(
-                    _persist_graph_edges_sync,
-                    graph_obj,
-                    inv_uuid,
-                )
-                graph_status = persist_result.get("status", "written")
-                edges_written = persist_result.get("edges_written", 0)
-                logger.info(
-                    "[%s] Graph edges persisted: %s (%s)",
-                    inv_uuid,
-                    edges_written,
-                    graph_status,
-                )
-
-                new_graph_status = "skipped_overflow" if graph_status == "skipped_overflow" else "built"
-                with get_session() as session:
-                    session.query(Investigation).filter_by(id=inv_uuid).update(
-                        {"graph_status": new_graph_status}
+            def _log_alias_task_result(t: "asyncio.Task") -> None:
+                try:
+                    t.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Alias resolution task raised (non-fatal): %s",
+                        inv_uuid, exc,
                     )
-                    session.commit()
-            except Exception as e:
-                logger.info("[%s] Edge persistence failed (non-fatal): %s", inv_uuid, e)
+            _alias_task.add_done_callback(_log_alias_task_result)
+            logger.info(
+                "[%s] Alias resolution scheduled (non-blocking)",
+                inv_uuid,
+            )
+        except Exception as _alias_exc:
+            logger.info(
+                "[%s] Alias resolution schedule failed (non-fatal): %s",
+                inv_uuid, _alias_exc,
+            )
 
-        except Exception as exc:
-            logger.exception("[%s] Graph building failed: %s", inv_uuid, str(exc))
-
+        # ===== Phase 6.2: Wrapped graph build (STEP 7) =====
+        await _run_with_timeout(
+            _build_graph_phase(extraction_results, inv_uuid, investigation_id),
+            PHASE_TIMEOUTS["graph_build"],
+            "graph_build",
+            investigation_id,
+        )
         await _update_progress(inv_uuid, 7)
 
-        # ===== STEP 8: Summary (no session held) =====
-        logger.info("[%s] STEP 8: Generating summary (%d pages available)...", inv_uuid, len(page_records))
-        if llm_client is None:
-            summary = (
-                f"Investigation completed without LLM summary. "
-                f"Scraped {scraped_count} pages; extracted {total_entities} entities."
-            )
-        else:
-            try:
-                summary_entities = []
-                if extraction_results:
-                    for result in extraction_results:
-                        summary_entities.extend(result.entities)
-
-                summary = await _llm_with_backoff(
-                    generate_summary,
-                    llm=llm_client,
-                    query=refined_query,
-                    content=page_records,
-                    entities=summary_entities if summary_entities else None,
-                    investigation_id=inv_uuid,
-                )
-                logger.info("[%s] Summary generated (%d chars)", inv_uuid, len(summary or ""))
-            except Exception as exc:
-                logger.exception("[%s] Summary generation failed, using fallback summary: %s", inv_uuid, exc)
-                summary = (
-                    f"Investigation complete for '{refined_query}'. "
-                    f"Analysis pipeline completed successfully, but summary generation failed: {exc}."
-                )
-
+        # ===== Phase 6.2: Wrapped summary (STEP 8) =====
+        summary = await _run_with_timeout(
+            _generate_summary_phase(
+                extraction_results,
+                page_records,
+                refined_query,
+                llm_client,
+                inv_uuid,
+                investigation_id,
+                scraped_count,
+                total_entities,
+            ),
+            PHASE_TIMEOUTS["summary"],
+            "summary",
+            investigation_id,
+        )
+        if summary is None:
+            summary = "Summary generation timed out."
         logger.info("[%s] Summary preview: %s", inv_uuid, (summary or "")[:100])
-
         await _update_progress(inv_uuid, 8)
 
-        # ===== Final: Update summary and mark completed (short-lived session) =====
-        with get_session() as session:
-            update_investigation_summary(session, inv_uuid, summary)
-            session.query(Investigation).filter_by(id=inv_uuid).update(
-                {"status": "completed"}
-            )
-            session.commit()
+        # ===== Phase 6.2: Wrapped finalize (Final: DB update) =====
+        await _run_with_timeout(
+            _finalize_phase(inv_uuid, summary),
+            PHASE_TIMEOUTS["finalize"],
+            "finalize",
+            investigation_id,
+        )
         await _update_progress(inv_uuid, 9)
         logger.info("[%s] Investigation COMPLETED (run_id=%s)", inv_uuid, run_id)
 
@@ -1725,6 +2132,67 @@ def _enrich_wallets_sync(investigation_id, blockcypher_token, etherscan_key):
             blockcypher_token=blockcypher_token,
             etherscan_key=etherscan_key,
             max_wallets=10,
+        )
+
+
+async def _update_actor_profiles(
+    entities: list,
+    investigation_id: "uuid.UUID",
+) -> None:
+    """Persist extracted THREAT_ACTOR_HANDLE / RANSOMWARE_GROUP entities into
+    the cross-investigation actor profile tables.
+
+    Designed to be scheduled via ``asyncio.create_task`` so it never
+    blocks the main pipeline.  Every step inside the manager swallows
+    its own errors; we wrap the whole call in try/except so any
+    unexpected failure (e.g. schema drift, missing module) is logged
+    at WARNING and never propagated.
+    """
+    try:
+        from sources.actor_profiles import ActorProfileManager
+
+        manager = ActorProfileManager()
+        stats = await manager.update_from_extraction(
+            entities=entities or [],
+            investigation_id=investigation_id,
+        )
+        logger.info(
+            "[%s] Actor profile update: %s",
+            investigation_id,
+            stats,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] Actor profile update failed (non-fatal): %s",
+            investigation_id,
+            exc,
+        )
+
+
+async def _run_alias_resolution(investigation_id: "uuid.UUID") -> None:
+    """Cross-alias resolution pass for actors found in *investigation_id*.
+
+    Wraps :func:`sources.actor_profiles.run_alias_resolution` in a
+    non-blocking, non-fatal shell so the investigation pipeline can
+    schedule it via ``asyncio.create_task`` and move on.  Any error is
+    logged at WARNING and never propagated.
+
+    The pass is purely additive — it never modifies the actor's
+    canonical handle, only inserts rows into ``actor_aliases`` with
+    ``alias_type`` ∈ {``likely_same_actor``, ``confirmed_same_actor``}.
+    """
+    try:
+        from sources.actor_profiles import run_alias_resolution
+
+        new_count = await run_alias_resolution(str(investigation_id))
+        logger.info(
+            "[%s] Alias resolution: %d new alias relationships",
+            investigation_id, new_count,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] Alias resolution failed (non-fatal): %s",
+            investigation_id, exc,
         )
 
 
@@ -2284,7 +2752,6 @@ async def get_investigation_entities(
             detail=f"Internal error: {exc!s}"[:500],
         )
 
-
 @router.get("/{investigation_id}/entities/export/csv")
 async def export_investigation_entities_csv(
     investigation_id: str,
@@ -2385,6 +2852,50 @@ async def export_investigation_entities_csv(
 MAX_GRAPH_NODES = 500
 
 
+def _rebuild_networkx_graph(nodes: list, edges: list) -> "nx.DiGraph":
+    """
+    Rebuild an ``nx.DiGraph`` from the API response's ``nodes`` and ``edges``.
+
+    The frontend previously re-ran Louvain on a graphology copy of this data,
+    which broke on large graphs and produced non-deterministic results across
+    renders.  The backend now performs community detection server-side, so we
+    just need a minimal graph that ``graph.builder.detect_communities`` can
+    consume.
+
+    Each node carries:
+        - entity_type (str, may be empty for stubs)
+        - confidence  (float)
+
+    Each edge carries:
+        - relationship_type (str, may be empty)
+        - confidence        (float)
+    """
+    import networkx as nx
+
+    G = nx.DiGraph()
+    for n in nodes:
+        nid = n.get("id")
+        if not nid:
+            continue
+        G.add_node(
+            nid,
+            entity_type=n.get("type") or "",
+            confidence=float(n.get("confidence") or 0.0),
+        )
+    for e in edges:
+        src = e.get("source")
+        tgt = e.get("target")
+        if not src or not tgt:
+            continue
+        G.add_edge(
+            src,
+            tgt,
+            relationship_type=e.get("type") or "",
+            confidence=float(e.get("confidence") or 0.0),
+        )
+    return G
+
+
 @router.get("/{investigation_id}/graph")
 async def get_investigation_graph(
     investigation_id: str,
@@ -2403,6 +2914,11 @@ async def get_investigation_graph(
     Use ?min_confidence=N to filter nodes/edges by confidence (default 0.75).
     Returns 400 if node count exceeds max_nodes - filter by entity type first.
     Returns 200 with {"graph_status": "skipped_overflow", ...} if graph was skipped due to size.
+
+    Response now includes ``communities`` (node_id → community_id) and
+    ``community_count``.  Community detection is computed server-side via
+    ``graph.builder.detect_communities`` (greedy modularity, deterministic)
+    so every render produces the same partitioning.
     """
     try:
         inv_uuid = uuid.UUID(investigation_id)
@@ -2412,7 +2928,11 @@ async def get_investigation_graph(
     try:
         from db.session import get_session
         from db.queries import get_investigation_by_id_or_run
-        from graph.builder import build_graph_from_db, build_graph_from_db_cached
+        from graph.builder import (
+            build_graph_from_db,
+            build_graph_from_db_cached,
+            detect_communities,
+        )
         from graph.export import to_json
         from db.models import EntityRelationship, Entity
         from sqlalchemy import func
@@ -2436,6 +2956,8 @@ async def get_investigation_graph(
                     "total_entities": entity_count,
                     "nodes": [],
                     "edges": [],
+                    "communities": {},
+                    "community_count": 0,
                 }
 
             persisted_edge_count = (
@@ -2486,6 +3008,12 @@ async def get_investigation_graph(
             if e["source"] in nodes_to_keep and e["target"] in nodes_to_keep
         ]
 
+        # Server-side community detection (deterministic; one Louvain/Clauset-Newman
+        # run per graph load instead of one per browser render).  Built on top of
+        # the *filtered* graph so colours line up with what's actually displayed.
+        community_graph = _rebuild_networkx_graph(filtered_nodes, filtered_edges)
+        communities = detect_communities(community_graph)
+
         return {
             "graph_status": graph_status,
             "total_entities": total_entities,
@@ -2493,12 +3021,389 @@ async def get_investigation_graph(
             "min_confidence": min_confidence,
             "nodes": filtered_nodes,
             "edges": filtered_edges,
+            "communities": communities,
+            "community_count": len(set(communities.values())) if communities else 0,
         }
     except HTTPException:
         raise
     except Exception as exc:
         logger.warning("get_investigation_graph failed: %s", exc)
-        return {"nodes": [], "edges": []}
+        return {
+            "nodes": [],
+            "edges": [],
+            "communities": {},
+            "community_count": 0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Shortest path between two entities
+# ---------------------------------------------------------------------------
+
+
+async def _find_entity_in_investigation(
+    investigation_id: "uuid.UUID | str",
+    value_or_id: str,
+    session,
+) -> "Any | None":
+    """
+    Resolve an endpoint's ``from`` / ``to`` parameter to an Entity row.
+
+    Accepts either:
+        * a UUID string (looked up directly via Entity.id, scoped to the
+          investigation through InvestigationEntityLink or
+          Entity.investigation_id)
+        * a canonical_value string (case-insensitive match)
+
+    Returns the Entity, or ``None`` if nothing in this investigation matches.
+    """
+    from db.models import Entity, InvestigationEntityLink
+
+    if not value_or_id:
+        return None
+
+    # Try UUID first
+    try:
+        ent_uuid = uuid.UUID(str(value_or_id))
+        entity = (
+            session.query(Entity)
+            .join(
+                InvestigationEntityLink,
+                InvestigationEntityLink.entity_id == Entity.id,
+            )
+            .filter(
+                InvestigationEntityLink.investigation_id == investigation_id,
+                Entity.id == ent_uuid,
+            )
+            .first()
+        )
+        if entity is not None:
+            return entity
+    except (ValueError, TypeError):
+        pass
+
+    # Try canonical_value (case-insensitive) — scoped via the link table or
+    # direct investigation_id, because the same canonical value can exist in
+    # multiple investigations.
+    return (
+        session.query(Entity)
+        .outerjoin(
+            InvestigationEntityLink,
+            InvestigationEntityLink.entity_id == Entity.id,
+        )
+        .filter(
+            (
+                (Entity.investigation_id == investigation_id)
+                | (InvestigationEntityLink.investigation_id == investigation_id)
+            ),
+            func.lower(Entity.canonical_value) == str(value_or_id).lower(),
+        )
+        .first()
+    )
+
+
+@router.get("/{investigation_id}/graph/path")
+async def get_investigation_graph_path(
+    investigation_id: str,
+    from_: str = Query(..., alias="from", description="Source entity: canonical_value or UUID"),
+    to: str = Query(..., description="Target entity: canonical_value or UUID"),
+    max_hops: int = Query(default=6, ge=1, le=20, description="Maximum hops allowed (default 6)"),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """
+    Shortest path between two entities in the investigation's relationship graph.
+
+    Returns:
+        {
+            "found": bool,
+            "path_length": int | null,   # number of hops
+            "hops": [                    # ordered list, source -> target
+                {
+                    "entity_id": str,    # UUID (may be null when the source/target
+                                         # was matched by canonical_value but the
+                                         # node has no DB row in the investigation)
+                    "node_id": str,      # graph node id (canonical_value or value)
+                    "entity_type": str,
+                    "canonical_value": str,
+                    "confidence": float,
+                    "relationship_to_previous": {  # only present on hops[1:]
+                        "type": str,
+                        "confidence": float,
+                    },
+                },
+                ...
+            ],
+            "from_entity": {...},        # canonical_value + entity_type
+            "to_entity":   {...},
+            "message": str | null,       # populated when found=false
+            "directed": bool,            # true if directed path; false if undirected fallback
+        }
+
+    Auth: requires ownership of the investigation (same pattern as the rest of
+    the investigation endpoints).
+    """
+    if not os.getenv("DATABASE_URL"):
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    try:
+        inv_uuid = uuid.UUID(investigation_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid investigation ID format")
+
+    empty_path_response: dict = {
+        "found": False,
+        "path_length": None,
+        "hops": [],
+        "from_entity": None,
+        "to_entity": None,
+        "message": None,
+        "directed": False,
+    }
+
+    try:
+        import networkx as nx
+        from graph.builder import find_shortest_path, _make_node_id
+        from db.models import (
+            Entity,
+            EntityRelationship,
+            InvestigationEntityLink,
+            Investigation,
+        )
+        from db.session import get_session
+        from db.queries import get_investigation_by_id_or_run
+
+        with get_session() as session:
+            inv = get_investigation_by_id_or_run(session, inv_uuid)
+            if inv is None:
+                raise HTTPException(status_code=404, detail="Investigation not found")
+            if str(inv.user_id) != str(current_user.user.id):
+                raise HTTPException(status_code=403, detail="Forbidden")
+            internal_id = inv.id
+
+            # Resolve both endpoints to Entity rows
+            from_ent = await _find_entity_in_investigation(
+                internal_id, from_, session
+            )
+            to_ent = await _find_entity_in_investigation(
+                internal_id, to, session
+            )
+
+            if from_ent is None:
+                empty_path_response["message"] = f"Source entity not found: {from_!r}"
+                empty_path_response["from_entity"] = {"value": from_}
+                return empty_path_response
+            if to_ent is None:
+                empty_path_response["message"] = f"Target entity not found: {to!r}"
+                empty_path_response["to_entity"] = {"value": to}
+                return empty_path_response
+
+            # Build graph by hand from persisted entities + relationships
+            # (cheaper than re-running the full builder, and matches the
+            # shape ``find_shortest_path`` expects — MultiDiGraph).
+            linked_ids_subq = (
+                session.query(InvestigationEntityLink.entity_id)
+                .filter(InvestigationEntityLink.investigation_id == internal_id)
+                .subquery()
+            )
+            entities = (
+                session.query(Entity)
+                .filter(
+                    (Entity.investigation_id == internal_id)
+                    | Entity.id.in_(linked_ids_subq)
+                )
+                .all()
+            )
+
+            entity_by_id: dict[str, Entity] = {str(e.id): e for e in entities}
+            # node_id (graph) → uuid of the DB entity row
+            node_to_entity_uuid: dict[str, str] = {}
+
+            G = nx.MultiDiGraph()
+            for ent in entities:
+                # Pick the most useful node id: prefer canonical_value, fall back to value.
+                # The graph builder uses the same convention for non-actor entities.
+                page_url = ent.page.url if ent.page else ""
+                nid = _make_node_id(ent.entity_type, ent.value, page_url)
+                G.add_node(
+                    nid,
+                    entity_id=str(ent.id),
+                    entity_type=ent.entity_type,
+                    canonical_value=ent.canonical_value or ent.value,
+                    confidence=float(ent.confidence or 0.0),
+                )
+                node_to_entity_uuid[nid] = str(ent.id)
+
+            # Add persisted relationships
+            relationships = (
+                session.query(EntityRelationship)
+                .filter(EntityRelationship.investigation_id == internal_id)
+                .all()
+            )
+            for rel in relationships:
+                src_uuid = str(rel.entity_a_id)
+                tgt_uuid = str(rel.entity_b_id)
+                if src_uuid not in entity_by_id or tgt_uuid not in entity_by_id:
+                    continue
+                src_node = node_to_entity_uuid.get(src_uuid)
+                tgt_node = node_to_entity_uuid.get(tgt_uuid)
+                if not src_node or not tgt_node or not G.has_node(src_node) or not G.has_node(tgt_node):
+                    continue
+                G.add_edge(
+                    src_node,
+                    tgt_node,
+                    edge_type=rel.relationship_type,
+                    confidence=float(rel.confidence or 0.0),
+                )
+
+            # Determine node ids for source and target. Prefer the node id
+            # matching their canonical_value; fall back to value; finally the
+            # UUID (rare — happens when node_id != canonical_value).
+            def _resolve_node_id(ent: Entity) -> "str | None":
+                # Try the graph builder's exact convention first
+                page_url = ent.page.url if ent.page else ""
+                nid = _make_node_id(ent.entity_type, ent.value, page_url)
+                if G.has_node(nid):
+                    return nid
+                # Then canonical_value as-is
+                cv = ent.canonical_value or ent.value
+                if G.has_node(cv):
+                    return cv
+                # Last resort — UUID itself
+                if G.has_node(str(ent.id)):
+                    return str(ent.id)
+                return None
+
+            source_node = _resolve_node_id(from_ent)
+            target_node = _resolve_node_id(to_ent)
+
+            if source_node is None or target_node is None:
+                empty_path_response["message"] = (
+                    "Endpoint entity is not part of this investigation's graph"
+                )
+                empty_path_response["from_entity"] = {
+                    "entity_id": str(from_ent.id),
+                    "entity_type": from_ent.entity_type,
+                    "canonical_value": from_ent.canonical_value or from_ent.value,
+                }
+                empty_path_response["to_entity"] = {
+                    "entity_id": str(to_ent.id),
+                    "entity_type": to_ent.entity_type,
+                    "canonical_value": to_ent.canonical_value or to_ent.value,
+                }
+                return empty_path_response
+
+            # Try directed first; if it fails, fall back to undirected.
+            directed = True
+            node_path = find_shortest_path(G, source_node, target_node, max_hops)
+            if node_path is None:
+                # try undirected explicitly so we can report which one found it
+                try:
+                    candidate = nx.shortest_path(
+                        G.to_undirected(), source_node, target_node
+                    )
+                    if len(candidate) - 1 <= max_hops:
+                        node_path = candidate
+                        directed = False
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    pass
+
+            if node_path is None:
+                empty_path_response["message"] = (
+                    f"No path found within {max_hops} hops"
+                )
+                empty_path_response["from_entity"] = {
+                    "entity_id": str(from_ent.id),
+                    "entity_type": from_ent.entity_type,
+                    "canonical_value": from_ent.canonical_value or from_ent.value,
+                }
+                empty_path_response["to_entity"] = {
+                    "entity_id": str(to_ent.id),
+                    "entity_type": to_ent.entity_type,
+                    "canonical_value": to_ent.canonical_value or to_ent.value,
+                }
+                return empty_path_response
+
+            # Build the per-hop response with relationship details between
+            # each consecutive pair. For undirected paths we still pick the
+            # highest-confidence edge between each pair (in either direction).
+            hops_out: list[dict] = []
+            for idx, nid in enumerate(node_path):
+                node_data = G.nodes[nid]
+                hop: dict = {
+                    "entity_id": node_data.get("entity_id"),
+                    "node_id": nid,
+                    "entity_type": node_data.get("entity_type", ""),
+                    "canonical_value": node_data.get("canonical_value", nid),
+                    "confidence": float(node_data.get("confidence") or 0.0),
+                }
+                if idx > 0:
+                    prev = node_path[idx - 1]
+                    edge_info = _best_edge_between(G, prev, nid, directed)
+                    hop["relationship_to_previous"] = edge_info
+                hops_out.append(hop)
+
+            return {
+                "found": True,
+                "path_length": len(node_path) - 1,
+                "hops": hops_out,
+                "from_entity": {
+                    "entity_id": str(from_ent.id),
+                    "entity_type": from_ent.entity_type,
+                    "canonical_value": from_ent.canonical_value or from_ent.value,
+                },
+                "to_entity": {
+                    "entity_id": str(to_ent.id),
+                    "entity_type": to_ent.entity_type,
+                    "canonical_value": to_ent.canonical_value or to_ent.value,
+                },
+                "directed": directed,
+                "message": None,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("get_investigation_graph_path failed: %s", exc)
+        empty_path_response["message"] = f"Internal error: {exc!s}"[:200]
+        return empty_path_response
+
+
+def _best_edge_between(
+    G: "nx.MultiDiGraph",
+    source: str,
+    target: str,
+    directed: bool,
+) -> dict:
+    """
+    Return the best edge between source and target (either direction when
+    directed=False, source→target only when directed=True).
+
+    Picks the edge with the highest confidence when multiple parallel edges
+    exist (MultiDiGraph).  Returns a dict with type + confidence, or an empty
+    dict when no edge exists (shouldn't happen for a real path, but guard
+    anyway).
+    """
+    candidates: list[dict] = []
+    if directed:
+        if G.has_edge(source, target):
+            for data in G.get_edge_data(source, target).values():
+                candidates.append(data)
+    else:
+        if G.has_edge(source, target):
+            for data in G.get_edge_data(source, target).values():
+                candidates.append(data)
+        if G.has_edge(target, source):
+            for data in G.get_edge_data(target, source).values():
+                candidates.append(data)
+
+    if not candidates:
+        return {}
+
+    best = max(candidates, key=lambda d: float(d.get("confidence") or 0.0))
+    return {
+        "type": best.get("edge_type", ""),
+        "confidence": float(best.get("confidence") or 0.0),
+    }
 
 
 def _build_investigation_profiles(investigation_id) -> int:

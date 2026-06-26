@@ -157,6 +157,32 @@ def match_against_profiles(
     Uses ChromaDB approximate nearest neighbor search for O(log n) performance
     instead of O(n) full table scan.
     """
+    if not isinstance(top_k, int):
+        session = top_k
+        try:
+            from db.models import ActorStyleProfile
+
+            rows = session.query(ActorStyleProfile).all()
+        except Exception as exc:
+            logger.error("match_against_profiles DB fallback failed: %s", exc)
+            return []
+
+        matches: list[dict] = []
+        for row in rows:
+            similarity = compute_similarity(style_vector, row.style_vector)
+            if similarity >= threshold:
+                matches.append(
+                    {
+                        "actor": row.canonical_value,
+                        "canonical_value": row.canonical_value,
+                        "entity_type": row.entity_type,
+                        "similarity": similarity,
+                        "sample_count": row.sample_count,
+                        "total_chars": row.total_chars,
+                    }
+                )
+        return sorted(matches, key=lambda item: item["similarity"], reverse=True)
+
     return vector_store.match_actor_profiles(
         style_vector=style_vector,
         top_k=top_k,

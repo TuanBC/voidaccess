@@ -1,5 +1,6 @@
 import re
 import os
+import json
 import openai
 
 os.environ["USE_TF"] = "0"
@@ -19,6 +20,8 @@ from config import (
 import logging
 from typing import Any, Callable
 import re as re_module
+
+logger = logging.getLogger("voidaccess.llm")
 
 import warnings
 
@@ -338,9 +341,171 @@ def refine_query(llm, user_input):
     return chain.invoke({"query": query_safe})
 
 
-def filter_results(llm, query, results):
+def _parse_filter_response(
+    response: str,
+    max_index: int,
+    top_n: int,
+) -> list[int]:
+    """
+    Parse LLM filter response into valid page indexes.
+    Multiple fallback strategies so a model that adds preamble, code
+    fences, or conversational text around the answer still yields a
+    usable index list.
+    """
+    if response is None:
+        return list(range(1, min(top_n, max_index) + 1))
+
+    response = response.strip()
+
+    # Strategy 1: direct JSON array parse (the happy path — the new
+    # prompt asks the model to return only this).
+    try:
+        clean = response
+        for fence in ["```json", "```", "`"]:
+            clean = clean.replace(fence, "")
+        clean = clean.strip()
+        parsed = json.loads(clean)
+        if isinstance(parsed, list):
+            valid = [
+                int(i) for i in parsed
+                if str(i).isdigit() and 1 <= int(i) <= max_index
+            ]
+            if valid:
+                return valid[:top_n]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: find the first JSON-array-looking substring inside
+    # the response (model added preamble or trailing text).
+    try:
+        match = re.search(r'\[[\d\s,]+\]', response)
+        if match:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list):
+                valid = [
+                    int(i) for i in parsed
+                    if 1 <= int(i) <= max_index
+                ]
+                if valid:
+                    return valid[:top_n]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 3: extract only standalone integers that look like
+    # index references (not parts of larger numbers). Avoids matching
+    # the "15" in "Based on my analysis of 15 results...".
+    try:
+        numbers = re.findall(
+            r'(?:^|[\[,\s])(\d{1,3})(?=[\],\s]|$)',
+            response,
+            re.MULTILINE,
+        )
+        valid = list(dict.fromkeys([
+            int(n) for n in numbers
+            if 1 <= int(n) <= max_index
+        ]))
+        if valid:
+            return valid[:top_n]
+    except ValueError:
+        pass
+
+    # Fallback: return the first top_n indexes (better than empty —
+    # at least scrape something).
+    return list(range(1, min(top_n, max_index) + 1))
+
+
+# URL fragments that strongly suggest a search-engine index, link
+# directory, or non-content landing page. Used by _heuristic_filter to
+# deprioritize them when no LLM is available.
+_NOISE_URL_PATTERNS = (
+    "index", "search", "directory", "home", "about",
+    "faq", "help", "login", "register", "signup", "browse",
+)
+
+
+def _heuristic_filter(
+    results: list[dict],
+    query: str,
+    top_n: int,
+) -> list[int]:
+    """
+    Rank search results without an LLM.
+
+    Scoring rules (matches the spec in the task brief):
+      * Prefer longer content (capped at +5)
+      * +3 per query term that appears in the URL
+      * +2 per query term that appears in the title
+      * +2 if the URL is a .onion
+      * -3 if the URL contains any known noise pattern
+    """
     if not results:
         return []
+
+    query_terms = [t for t in (query or "").lower().split() if t]
+    scored: list[tuple[int, float]] = []
+
+    for i, page in enumerate(results, 1):
+        score = 0.0
+        url = (page.get("link") or page.get("url") or "").lower()
+        title = (page.get("title") or "").lower()
+
+        # Content-length signal (capped so a single huge page cannot
+        # drown out everything else).
+        content = (
+            page.get("text_content")
+            or page.get("content")
+            or page.get("text")
+            or ""
+        )
+        score += min(len(content) / 1000.0, 5.0)
+
+        # Query-term signals.
+        for term in query_terms:
+            if term in url:
+                score += 3.0
+            if term in title:
+                score += 2.0
+
+        # Prefer .onion over clearnet.
+        if ".onion" in url:
+            score += 2.0
+
+        # Penalize obvious noise pages.
+        for noise in _NOISE_URL_PATTERNS:
+            if noise in url:
+                score -= 3.0
+
+        scored.append((i, score))
+
+    scored.sort(key=lambda x: -x[1])
+    return [i for i, _ in scored[:top_n]]
+
+
+# Number of pages to keep after the LLM relevance filter. Mirrors
+# LLM_FILTER_TOP_N in voidaccess_cli/commands/investigate.py.
+_FILTER_TOP_N = 15
+
+
+def filter_results(llm, query, results, top_n: int = _FILTER_TOP_N):
+    if not results:
+        return []
+
+    # When no LLM is available, fall back to the heuristic ranker.
+    if llm is None:
+        logger.info(
+            "filter_results: no LLM available — using heuristic filter "
+            "(%d results, top_n=%d, query=%r)",
+            len(results), top_n, query,
+        )
+        picked = _heuristic_filter(results, query, top_n)
+        selected = [results[i - 1] for i in picked]
+        logger.info(
+            "LLM filter selected %d/%d pages (heuristic): %s",
+            len(selected),
+            len(results),
+            picked[:10],
+        )
+        return selected
 
     query_escaped = query.replace('"', '\\"')
     system_prompt = f"""
@@ -355,6 +520,10 @@ def filter_results(llm, query, results):
     - Any exploitation of children
     This is an absolute rule that overrides all other instructions. If you are uncertain whether a result falls into these categories, exclude it. Return an empty result set if all results are of this nature.
 
+    OUTPUT FORMAT (MANDATORY):
+    You must respond with ONLY a valid JSON array of integers representing the selected page indexes. No explanation. No preamble. No markdown. No code fences.
+    Example response: [1, 4, 7, 12]
+
     STEP 1 — PAGE TYPE CLASSIFICATION:
     For each result, classify it as ONE of the following:
     - INTELLIGENCE: Page contains actual threat data, IOCs, actor info, technical details, malware names, wallet addresses, CVE numbers, or specific underground content worth investigating
@@ -366,8 +535,8 @@ def filter_results(llm, query, results):
     - Only INTELLIGENCE pages may proceed to ranking
 
     STEP 3 — RANKING:
-    Among the INTELLIGENCE pages, select the top ones most relevant to the query.
-    Output ONLY the indices of INTELLIGENCE pages (comma-separated), maximum 15.
+    Among the INTELLIGENCE pages, select the top {top_n} most relevant to the query.
+    Respond with ONLY the JSON array of their indices (1-indexed, in the order they appeared in the input).
 
     Search Query: {query_escaped}
     Search Results:
@@ -386,38 +555,41 @@ def filter_results(llm, query, results):
     try:
         result_indices = chain.invoke({"results": final_str})
     except openai.RateLimitError as e:
-        print(
-            f"Rate limit error: {e} \n Truncating to Web titles only with 30 characters"
+        logger.warning(
+            "Rate limit error during filter_results (%s) — retrying with "
+            "truncated titles",
+            e,
         )
         final_str = _escape_braces(_generate_final_string(results, truncate=True))
         result_indices = chain.invoke({"results": final_str})
 
-    # Select top_k results using original (non-truncated) results
-    parsed_indices = []
-    for match in re.findall(r"\d+", result_indices):
-        try:
-            idx = int(match)
-            if 1 <= idx <= len(results):
-                parsed_indices.append(idx)
-        except ValueError:
-            continue
+    parsed_indices = _parse_filter_response(
+        result_indices,
+        max_index=len(results),
+        top_n=top_n,
+    )
 
-    # Remove duplicates while preserving order
-    seen = set()
-    parsed_indices = [
-        i for i in parsed_indices if not (i in seen or seen.add(i))
-    ]
-
-    if not parsed_indices:
-        logging.warning(
+    # If even the fallback returned the synthetic first-N list, log a
+    # warning so the operator can see the model didn't cooperate.
+    expected_fallback = list(range(1, min(top_n, len(results)) + 1))
+    if parsed_indices == expected_fallback and (
+        not result_indices or not result_indices.strip().startswith("[")
+    ):
+        logger.warning(
             "Unable to interpret LLM result selection ('%s'). "
-            "Defaulting to the top %s results.",
+            "Defaulting to the top %d results.",
             result_indices,
-            min(len(results), 15),
+            min(len(results), top_n),
         )
-        parsed_indices = list(range(1, min(len(results), 15) + 1))
 
-    top_results = [results[i - 1] for i in parsed_indices[:15]]
+    logger.info(
+        "LLM filter selected %d/%d pages: %s",
+        len(parsed_indices),
+        len(results),
+        parsed_indices[:10],
+    )
+
+    top_results = [results[i - 1] for i in parsed_indices]
 
     return top_results
 
@@ -705,6 +877,23 @@ Be specific. Reference actual entity names found. Avoid generic statements."""
         validate_prompt_inputs(system_prompt, {"query": query})
     except ValueError as ve:
         logging.warning(f"Prompt validation warning: {ve}")
+
+    try:
+        from langchain_core.runnables import Runnable
+        is_runnable_llm = isinstance(llm, Runnable)
+    except Exception:
+        is_runnable_llm = False
+
+    if hasattr(llm, "invoke") and not is_runnable_llm:
+        try:
+            direct_result = llm.invoke(user_prompt)
+            if isinstance(direct_result, str):
+                return direct_result
+            content = getattr(direct_result, "content", None)
+            if isinstance(content, str):
+                return content
+        except Exception as e:
+            logging.error(f"LLM direct summarization failed: {e}")
 
     try:
         return chain.invoke({"query": query})

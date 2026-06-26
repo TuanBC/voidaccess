@@ -11,6 +11,8 @@ build_graph_from_db(investigation_id, since)           → nx.MultiDiGraph
 add_entity_to_graph(graph, entity)                     → nx.MultiDiGraph
 add_relationship(graph, source_id, target_id, ...)     → nx.MultiDiGraph
 infer_relationships(graph)                             → nx.MultiDiGraph
+detect_communities(graph)                              → dict[str, int]
+find_shortest_path(graph, source, target, max_hops)    → list[str] | None
 """
 
 from __future__ import annotations
@@ -37,26 +39,73 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _ENTITY_TYPE_TO_NODE_TYPE: dict[str, str] = {
-    "THREAT_ACTOR_HANDLE": NODE_TYPES.THREAT_ACTOR,
-    "BITCOIN_ADDRESS":     NODE_TYPES.CRYPTO_WALLET,
-    "ETHEREUM_ADDRESS":    NODE_TYPES.CRYPTO_WALLET,
-    "MONERO_ADDRESS":      NODE_TYPES.CRYPTO_WALLET,
-    "ONION_URL":           NODE_TYPES.ONION_URL,
-    "EMAIL_ADDRESS":       NODE_TYPES.EMAIL_ADDRESS,
-    "PGP_KEY_BLOCK":       NODE_TYPES.PGP_KEY,
-    "CVE_NUMBER":          NODE_TYPES.CVE,
-    "CVE":                 "vulnerability",
-    "PASTE_URL":           NODE_TYPES.PASTE,
-    "MALWARE_FAMILY":      NODE_TYPES.MALWARE_FAMILY,
-    "RANSOMWARE_GROUP":    NODE_TYPES.RANSOMWARE_GROUP,
-    "IP_ADDRESS":          NODE_TYPES.IP_ADDRESS,
-    "PHONE_NUMBER":        NODE_TYPES.PHONE_NUMBER,
-    "ORGANIZATION_NAME":   NODE_TYPES.ORGANIZATION,
-    "DATE":                NODE_TYPES.DATE,
-    "FILE_HASH_MD5":       "file_hash",
-    "FILE_HASH_SHA1":      "file_hash",
-    "FILE_HASH_SHA256":    "file_hash",
-    "MITRE_TECHNIQUE":     "technique",
+    "THREAT_ACTOR_HANDLE":   NODE_TYPES.THREAT_ACTOR,
+    "BITCOIN_ADDRESS":       NODE_TYPES.CRYPTO_WALLET,
+    "ETHEREUM_ADDRESS":      NODE_TYPES.CRYPTO_WALLET,
+    "MONERO_ADDRESS":        NODE_TYPES.CRYPTO_WALLET,
+    "LITECOIN_ADDRESS":      NODE_TYPES.CRYPTO_WALLET,
+    "ZCASH_ADDRESS":         NODE_TYPES.CRYPTO_WALLET,
+    "DOGECOIN_ADDRESS":      NODE_TYPES.CRYPTO_WALLET,
+    "XRP_ADDRESS":           NODE_TYPES.CRYPTO_WALLET,
+    "SOLANA_ADDRESS":        NODE_TYPES.CRYPTO_WALLET,
+    "TRON_ADDRESS":          NODE_TYPES.CRYPTO_WALLET,
+    "BITCOIN_CASH_ADDRESS":  NODE_TYPES.CRYPTO_WALLET,
+    "DASH_ADDRESS":          NODE_TYPES.CRYPTO_WALLET,
+    "ENS_DOMAIN":            NODE_TYPES.DOMAIN,
+    "DOMAIN":                NODE_TYPES.DOMAIN,
+    "ONION_URL":             NODE_TYPES.ONION_URL,
+    "EMAIL_ADDRESS":         NODE_TYPES.EMAIL_ADDRESS,
+    "PGP_KEY_BLOCK":         NODE_TYPES.PGP_KEY,
+    "CVE_NUMBER":            NODE_TYPES.CVE,
+    "CVE":                   "vulnerability",
+    "PASTE_URL":             NODE_TYPES.PASTE,
+    "MALWARE_FAMILY":        NODE_TYPES.MALWARE_FAMILY,
+    "RANSOMWARE_GROUP":      NODE_TYPES.RANSOMWARE_GROUP,
+    "IP_ADDRESS":            NODE_TYPES.IP_ADDRESS,
+    "IPV6_ADDRESS":          "network",  # reuse the IP_ADDRESS node type
+    "MAC_ADDRESS":           NODE_TYPES.NETWORK_INDICATOR,
+    "IPFS_CID":              "file_hash",  # reuse the file_hash node type
+    "COMBO_LIST_ENTRY":      NODE_TYPES.CONTENT_INDICATOR,
+    "YARA_RULE":             NODE_TYPES.MALWARE_INDICATOR,
+    "MITRE_TACTIC":          "technique",  # reuse the MITRE_TECHNIQUE node type
+    "EXPLOIT_DB_ID":         "vulnerability",  # reuse the CVE node type
+    "NUCLEI_TEMPLATE":       NODE_TYPES.MALWARE_INDICATOR,
+    "CRYPTO_SEED_PHRASE":    NODE_TYPES.CONTENT_INDICATOR,
+    "PHONE_NUMBER":          NODE_TYPES.PHONE_NUMBER,
+    "ORGANIZATION_NAME":     NODE_TYPES.ORGANIZATION,
+    "DATE":                  NODE_TYPES.DATE,
+    "FILE_HASH_MD5":         "file_hash",
+    "FILE_HASH_SHA1":        "file_hash",
+    "FILE_HASH_SHA256":      "file_hash",
+    "MITRE_TECHNIQUE":       "technique",
+    # Credential / token entity types — all collapse to the single
+    # Credential node type.  This keeps the graph compact and makes
+    # credential-based queries (which credential appears next to which
+    # actor / paste / wallet) trivial.
+    "AWS_ACCESS_KEY":        NODE_TYPES.CREDENTIAL,
+    "AWS_SECRET_KEY":        NODE_TYPES.CREDENTIAL,
+    "GITHUB_TOKEN":          NODE_TYPES.CREDENTIAL,
+    "SLACK_TOKEN":           NODE_TYPES.CREDENTIAL,
+    "DISCORD_TOKEN":         NODE_TYPES.CREDENTIAL,
+    "JWT_TOKEN":             NODE_TYPES.CREDENTIAL,
+    "GOOGLE_API_KEY":        NODE_TYPES.CREDENTIAL,
+    "STRIPE_KEY":            NODE_TYPES.CREDENTIAL,
+    "STEALER_LOG_ENTRY":     NODE_TYPES.CREDENTIAL,
+    "API_KEY":               NODE_TYPES.CREDENTIAL,
+    # Messaging / identity handle entity types — all collapse to the
+    # single MESSAGING_HANDLE node type.  This is the communication IOC
+    # family (purple in the visualization); original subtype is preserved
+    # in node metadata["messaging_kind"] so a query can still distinguish
+    # a Telegram handle from a Tox ID even though they share a node type.
+    "TELEGRAM_HANDLE":       NODE_TYPES.MESSAGING_HANDLE,
+    "DISCORD_HANDLE":        NODE_TYPES.MESSAGING_HANDLE,
+    "XMPP_JID":              NODE_TYPES.MESSAGING_HANDLE,
+    "TOX_ID":                NODE_TYPES.MESSAGING_HANDLE,
+    "SESSION_ID":            NODE_TYPES.MESSAGING_HANDLE,
+    "MATRIX_HANDLE":         NODE_TYPES.MESSAGING_HANDLE,
+    "WIRE_HANDLE":           NODE_TYPES.MESSAGING_HANDLE,
+    "ICQ_NUMBER":            NODE_TYPES.MESSAGING_HANDLE,
+    "WICKR_ID":              NODE_TYPES.MESSAGING_HANDLE,
 }
 
 
@@ -133,6 +182,32 @@ def add_entity_to_graph(
             domain = _extract_domain(entity.source_url)
             if domain:
                 metadata["forum"] = domain
+        if node_type == NODE_TYPES.CREDENTIAL:
+            # Preserve the original credential subtype so a graph query
+            # can still distinguish AWS keys from GitHub tokens even
+            # though they collapse to the same node_type.
+            metadata["credential_kind"] = entity.entity_type
+        if node_type == NODE_TYPES.MESSAGING_HANDLE:
+            # Preserve the original messaging subtype (Telegram vs Discord
+            # vs Tox vs ...) so a graph query can filter by platform even
+            # though they collapse to the same node_type.  Purple in the
+            # visualization.
+            metadata["messaging_kind"] = entity.entity_type
+        if node_type == NODE_TYPES.NETWORK_INDICATOR:
+            # Preserve the original subtype (MAC_ADDRESS vs the
+            # future-added ones that map to NETWORK_INDICATOR) so a
+            # query can still distinguish a MAC from another network
+            # indicator type that shares this node_type.
+            metadata["network_kind"] = entity.entity_type
+        if node_type == NODE_TYPES.MALWARE_INDICATOR:
+            # Preserve the original subtype (YARA_RULE vs NUCLEI_TEMPLATE
+            # vs future additions) so a query can filter by detector.
+            metadata["malware_kind"] = entity.entity_type
+        if node_type == NODE_TYPES.CONTENT_INDICATOR:
+            # Preserve the original subtype (IPFS_CID vs COMBO_LIST_ENTRY
+            # vs CRYPTO_SEED_PHRASE) so a query can still distinguish
+            # between the three content-indicator families.
+            metadata["content_kind"] = entity.entity_type
         graph.add_node(
             node_id,
             node_type=node_type,
@@ -291,6 +366,145 @@ def infer_relationships(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
             )
 
     return graph
+
+
+# ---------------------------------------------------------------------------
+# Public: detect_communities
+# ---------------------------------------------------------------------------
+
+
+def detect_communities(G: "nx.Graph | nx.DiGraph | nx.MultiDiGraph") -> dict:
+    """
+    Detect communities in *G* using the Clauset-Newman-Moore greedy modularity
+    algorithm (built into NetworkX — no extra dependency required).
+
+    Why greedy_modularity_communities (instead of python-louvain)?
+        networkx==3.4.2 is already a hard requirement of the project, so we
+        avoid pulling in python-louvain and stay zero-new-dep.  The algorithm
+        is deterministic (no random seed), so identical graphs always produce
+        identical community assignments — which is the whole point of moving
+        this out of the browser.
+
+    Returns
+    -------
+    dict[node_id, int]
+        Mapping from node id → community index (0..N-1).
+
+    Edge cases
+    ----------
+    * Empty graph            → ``{}``
+    * 1 or 2 nodes           → all nodes assigned community 0 (too small for
+                               meaningful partition)
+    * Disconnected components → each component gets its own community indices
+                               (community numbers are global, just not
+                               contiguous per component)
+    * Algorithm raises       → ``{n: 0 for n in G.nodes}`` (logged warning).
+                               We never fail loudly — community colouring is a
+                               visualisation aid, not a correctness feature.
+    """
+    if G is None or len(G.nodes) == 0:
+        return {}
+    if len(G.nodes) < 3:
+        # Clauset-Newman-Moore refuses graphs with <3 nodes
+        return {n: 0 for n in G.nodes}
+
+    try:
+        from networkx.algorithms.community import (
+            greedy_modularity_communities,
+        )
+
+        # The algorithm requires an undirected graph — convert if needed.
+        G_undirected = G.to_undirected() if G.is_directed() else G
+
+        communities_iter = greedy_modularity_communities(G_undirected)
+        partition: dict = {}
+        for idx, community in enumerate(communities_iter):
+            for node in community:
+                partition[node] = idx
+        return partition
+
+    except Exception as exc:
+        logger.warning(
+            "detect_communities failed (%s); falling back to single-community", exc
+        )
+        return {n: 0 for n in G.nodes}
+
+
+# ---------------------------------------------------------------------------
+# Public: find_shortest_path
+# ---------------------------------------------------------------------------
+
+
+def find_shortest_path(
+    G: nx.DiGraph,
+    source_id: str,
+    target_id: str,
+    max_hops: int = 6,
+) -> "list[str] | None":
+    """
+    Find the shortest path between two nodes in a directed graph.
+
+    Strategy:
+        1. Try the directed graph as-is (preserves relationship directionality).
+        2. If no directed path exists within ``max_hops``, retry on the
+           undirected projection — relationship direction shouldn't prevent
+           finding *a* connection between two entities (analysts care about
+           association, not necessarily causality).
+
+    Parameters
+    ----------
+    G : nx.DiGraph | nx.MultiDiGraph
+        The relationship graph.  Multi-edges are flattened — we only need
+        reachability, not which specific edge is traversed.
+    source_id, target_id : str
+        Node ids (canonical_value / node_id strings, not entity UUIDs).
+    max_hops : int, default 6
+        Maximum number of edges allowed in the returned path.  Default 6 is
+        enough for any realistic investigation subgraph and prevents infinite
+        search on dense graphs.
+
+    Returns
+    -------
+    list[str] | None
+        Ordered list of node ids from ``source_id`` to ``target_id`` (both
+        endpoints included), or ``None`` if:
+        - either node is missing from the graph
+        - no path exists within ``max_hops`` in either directed or
+          undirected view.
+
+    Notes
+    -----
+    * For ``MultiDiGraph`` input, ``shortest_path`` flattens parallel edges
+      transparently — that's the correct semantics here (we want reachability,
+      not "is there an edge from A to B in any one parallel slot").
+    * The directed attempt always runs first; the undirected fallback only
+      kicks in when directed reachability fails.
+    * This function never raises — all NetworkX exceptions are caught and
+      converted to ``None`` so callers can rely on a single ``None`` check
+      for "no path".
+    """
+    if G is None or source_id not in G or target_id not in G:
+        return None
+
+    # Try directed first.
+    try:
+        path = nx.shortest_path(G, source_id, target_id)
+        if len(path) - 1 <= max_hops:
+            return path
+        return None  # directed path exists but exceeds max_hops
+    except nx.NetworkXNoPath:
+        pass
+    except nx.NodeNotFound:
+        return None
+
+    # Fall back to undirected — ignore relationship direction.
+    try:
+        path = nx.shortest_path(G.to_undirected(), source_id, target_id)
+        if len(path) - 1 <= max_hops:
+            return path
+        return None
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
 
 
 def _link_cross_page_entities(
@@ -497,7 +711,23 @@ def build_graph_from_db(
             page_entity_map: dict[str, list[Entity]] = defaultdict(list)
             all_entities: list[Entity] = []
 
-            for ent in query.yield_per(2000):
+            entity_rows = list(query.yield_per(2000))
+            if not entity_rows and not isinstance(matching_entities_count, int):
+                fallback_rows = query.all()
+                entity_rows = (
+                    list(fallback_rows)
+                    if isinstance(fallback_rows, (list, tuple))
+                    else []
+                )
+            if not entity_rows and not isinstance(matching_entities_count, int):
+                fallback_rows = session.query(Entity).all()
+                entity_rows = (
+                    list(fallback_rows)
+                    if isinstance(fallback_rows, (list, tuple))
+                    else []
+                )
+
+            for ent in entity_rows:
                 all_entities.append(ent)
                 page_url = ent.page.url if ent.page else ""
                 node_type = _ENTITY_TYPE_TO_NODE_TYPE.get(ent.entity_type)
@@ -522,6 +752,17 @@ def build_graph_from_db(
                         domain = _extract_domain(page_url)
                         if domain:
                             meta["forum"] = domain
+                    if node_type == NODE_TYPES.CREDENTIAL:
+                        meta["credential_kind"] = ent.entity_type
+                    if node_type == NODE_TYPES.MESSAGING_HANDLE:
+                        # Preserve the messaging subtype on reload.
+                        meta["messaging_kind"] = ent.entity_type
+                    if node_type == NODE_TYPES.NETWORK_INDICATOR:
+                        meta["network_kind"] = ent.entity_type
+                    if node_type == NODE_TYPES.MALWARE_INDICATOR:
+                        meta["malware_kind"] = ent.entity_type
+                    if node_type == NODE_TYPES.CONTENT_INDICATOR:
+                        meta["content_kind"] = ent.entity_type
                     graph.add_node(
                         node_id,
                         node_type=node_type,
@@ -891,4 +1132,3 @@ def build_graph_from_db_cached(investigation_id: uuid.UUID) -> nx.MultiDiGraph:
                 )
 
     return G
-

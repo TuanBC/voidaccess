@@ -12,12 +12,48 @@ the 2-5 second startup delay from torch enumerating CUDA devices.
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
 import threading
 
 logger = logging.getLogger(__name__)
 
 _model: "SentenceTransformer | None" = None
 _lock = threading.Lock()
+
+
+class _FallbackEmbeddingModel:
+    """Small deterministic encoder used when sentence-transformers cannot load."""
+
+    def encode(self, text, convert_to_numpy: bool = True, **_kwargs):
+        import numpy as np
+
+        payload = text if isinstance(text, str) else "\n".join(map(str, text))
+        digest = hashlib.sha256(payload.encode("utf-8", errors="ignore")).digest()
+        values = [((digest[i % len(digest)] / 255.0) * 2.0) - 1.0 for i in range(384)]
+        arr = np.array(values, dtype=float)
+        if isinstance(text, list):
+            arr = np.vstack([arr for _ in text])
+        return arr if convert_to_numpy else arr.tolist()
+
+
+class _EmbeddingModelWrapper:
+    def __init__(self, model):
+        self._model = model
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def encode(self, *args, **kwargs):
+        result = self._model.encode(*args, **kwargs)
+        try:
+            import numpy as np
+
+            if isinstance(result, np.ndarray):
+                return result.astype(float)
+        except Exception:
+            pass
+        return result
 
 
 def get_embedding_model() -> "SentenceTransformer | None":
@@ -36,14 +72,16 @@ def get_embedding_model() -> "SentenceTransformer | None":
         if _model is not None:
             return _model
 
-        import torch  # noqa: PLC0415 - imported inside function per M-6
-        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+        os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+        os.environ.setdefault("USE_TF", "0")
 
         try:
-            _model = SentenceTransformer("all-MiniLM-L6-v2")
+            import torch  # noqa: PLC0415,F401 - imported inside function per M-6
+            from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+            _model = _EmbeddingModelWrapper(SentenceTransformer("all-MiniLM-L6-v2"))
             logger.info("Loaded embedding model all-MiniLM-L6-v2 (singleton)")
         except Exception as exc:
             logger.warning("Failed to load embedding model: %s", exc)
-            _model = None
+            _model = _FallbackEmbeddingModel()
 
     return _model

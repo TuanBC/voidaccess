@@ -27,9 +27,11 @@ import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
+
+from utils.enrichment_cache import DEFAULT_TTL, get_enrichment_cache
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,16 @@ _emailrep_cache: dict[str, dict] = {}
 
 # Disposable domain set cache (module-level singleton)
 _disposable_cache: dict[str, Any] = {"domains": frozenset(), "loaded_at": 0.0}
+
+# Module-level enrichment cache singleton (lazy-init on first lookup).
+_enrichment_cache_singleton: Optional[Any] = None
+
+
+async def _get_enrichment_cache():
+    global _enrichment_cache_singleton
+    if _enrichment_cache_singleton is None:
+        _enrichment_cache_singleton = await get_enrichment_cache()
+    return _enrichment_cache_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +259,33 @@ async def query_hibp(email: str) -> dict[str, Any]:
     return result
 
 
+async def _cached_query_hibp(email: str) -> dict[str, Any]:
+    """Cached wrapper around query_hibp (48h TTL via DEFAULT_TTL).
+
+    Skipped / auth-error / rate-limited results are NOT cached — the next run
+    should retry. Both 404 (``hibp_not_found``) and found results ARE cached
+    so repeat lookups for the same email don't hit HIBP.
+    """
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("EMAIL_ADDRESS", email, "hibp")
+    if cached is not None:
+        logger.debug("HIBP cache hit: %s", _safe_log_email(email))
+        return cached
+    result = await query_hibp(email)
+    source_key = result.get("source") or ""
+    if source_key and source_key not in (
+        "hibp_skipped",
+        "hibp_auth_error",
+        "hibp_rate_limited",
+        "hibp_error",
+    ):
+        await cache.set(
+            "EMAIL_ADDRESS", email, "hibp",
+            result, DEFAULT_TTL["hibp"],
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Source: EmailRep.io
 # ---------------------------------------------------------------------------
@@ -325,6 +364,24 @@ async def query_emailrep(email: str) -> dict[str, Any]:
     return result
 
 
+async def _cached_query_emailrep(email: str) -> dict[str, Any]:
+    """Cached wrapper around query_emailrep (24h TTL via DEFAULT_TTL)."""
+    cache = await _get_enrichment_cache()
+    cached = await cache.get("EMAIL_ADDRESS", email, "emailrep")
+    if cached is not None:
+        logger.debug("EmailRep cache hit: %s", _safe_log_email(email))
+        return cached
+    result = await query_emailrep(email)
+    # EmailRep returns the "empty" dict (reputation=None etc.) for 400/429.
+    # We cache it because the empty result IS the cached fact: that the email
+    # has no EmailRep data. This protects the rate-limited path.
+    await cache.set(
+        "EMAIL_ADDRESS", email, "emailrep",
+        result, DEFAULT_TTL["emailrep"],
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Core reputation check
 # ---------------------------------------------------------------------------
@@ -369,8 +426,8 @@ async def check_email_reputation(
 
     disposable_check, hibp_result, emailrep_result = await asyncio.gather(
         is_disposable_domain(domain),
-        query_hibp(email),
-        query_emailrep(email),
+        _cached_query_hibp(email),
+        _cached_query_emailrep(email),
         return_exceptions=True,
     )
 

@@ -2,6 +2,36 @@
 
 All notable changes to VoidAccess are documented here.
 
+## [1.5.0] - 2026-06-25
+### Added
+- 37 new entity types across crypto addresses,
+  credential patterns, messaging handles, and
+  network/forensic identifiers
+- Persistent actor profiles with cross-alias
+  resolution (5 signals) and activity timeline
+- IOC package ZIP export bundling all formats
+- Full YARA rule generation
+- Full Snort + Suricata rule generation
+- Backend Louvain community detection
+  (deterministic, survives restarts)
+- Path-between-nodes query (API + CLI + UI)
+- Enrichment cross-run cache (Redis/SQLite/memory)
+  with per-source TTLs
+- Seed auto-discovery from scraped pages
+- Per-phase pipeline timeouts (all env-configurable)
+- sources_used and infrastructure_clusters
+  persisted to investigation metadata
+- Stuck investigation sweep on startup
+
+### Fixed
+- entity_type always uppercase at SQLite boundary
+  (C2 IP count was always 0)
+- LLM filter structured JSON output with
+  3-strategy fallback parser
+- LLM extraction enabled in Docker API
+  (was silently CLI-only)
+- Enrichment cache prevents repeat API quota waste
+
 ## [1.4.7] - 2026-06-04
 ### Fixed
 - Critical: clearnet pages (GitHub, GitLab,

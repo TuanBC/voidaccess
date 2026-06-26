@@ -13,7 +13,14 @@ from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 
 from config import TOR_PROXY_HOST, TOR_PROXY_PORT
-from search.circuit_breaker import record_failure, record_success, is_open
+from db.search_engine_stats import (
+    engine_priority_score,
+    get_all_engine_stats_async,
+    get_engine_timeout,
+    record_engine_attempt_async,
+    should_skip_engine_async,
+)
+from search.query_builder import diversify_query
 from utils.async_utils import run_async
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,7 @@ SEARCH_TIMEOUT = 30
 ENGINE_RETRY_COUNT = 2
 
 _ENGINE_STATUS: dict[str, dict] = {}
+_LAST_SEARCH_SUMMARY: dict[str, int] = {}
 
 
 @dataclass
@@ -233,8 +241,48 @@ def _parse_html_links(html: str, base_url: str) -> list[dict]:
     return links
 
 
-async def _search_async(query: str, max_workers: int = MAX_CONCURRENT) -> list[EngineResult]:
+def _default_stats(name: str) -> dict:
+    return {
+        "engine_name": name,
+        "total_attempts": 0,
+        "total_successes": 0,
+        "total_results": 0,
+        "consecutive_failures": 0,
+        "avg_response_time_ms": 0,
+        "is_circuit_open": False,
+        "score": 0.5,
+    }
+
+
+async def _search_async(
+    query: str,
+    max_workers: int = MAX_CONCURRENT,
+    llm_client=None,
+    engines: Optional[list[dict]] = None,
+    allow_diversify: bool = True,
+) -> list[EngineResult]:
+    global _LAST_SEARCH_SUMMARY
     semaphore = asyncio.Semaphore(max_workers)
+    engine_list = list(engines or SEARCH_ENGINES)
+    try:
+        stats_rows = await get_all_engine_stats_async()
+    except Exception:
+        stats_rows = []
+    stats_by_name = {row["engine_name"]: row for row in stats_rows}
+    sorted_engines = sorted(
+        engine_list,
+        key=lambda e: engine_priority_score(stats_by_name.get(e["name"], _default_stats(e["name"]))),
+        reverse=True,
+    )
+    active_engines: list[dict] = []
+    skipped_results: list[EngineResult] = []
+    record_tasks: list[asyncio.Task] = []
+    for engine in sorted_engines:
+        name = engine["name"]
+        if await should_skip_engine_async(name):
+            skipped_results.append(EngineResult(name=name, links=[], error="circuit_open"))
+            continue
+        active_engines.append(engine)
 
     connector = _tor_aiohttp_connector()
     async with aiohttp.ClientSession(
@@ -244,54 +292,95 @@ async def _search_async(query: str, max_workers: int = MAX_CONCURRENT) -> list[E
 
         async def run_engine(engine: dict) -> EngineResult:
             name = engine["name"]
-            if await is_open(name):
-                logger.warning(f"Skipping unhealthy engine: {name}")
-                return EngineResult(name=name, links=[], error="circuit_open")
-
-            url = engine["url"].format(query=query)
+            timeout = get_engine_timeout(stats_by_name.get(name, _default_stats(name)))
 
             async def fetch_with_engine_session():
                 result = await _fetch_engine(engine, query, session, semaphore)
-                if result.error:
-                    if "HTTP 4" not in result.error:
-                        await record_failure(name)
-                    logger.warning(f"Engine {name} failed: {result.error}")
-                else:
-                    await record_success(name)
-                    if not result.links:
-                        logger.warning(f"Engine {name} returned 0 results")
                 return result
 
+            start = time.monotonic()
             try:
-                return await asyncio.wait_for(fetch_with_engine_session(), timeout=ENGINE_TIMEOUT)
+                result = await asyncio.wait_for(fetch_with_engine_session(), timeout=timeout)
+                result.took_ms = int((time.monotonic() - start) * 1000)
+                success = result.error is None
+                task = record_engine_attempt_async(name, success, len(result.links), result.took_ms)
+                if task is not None:
+                    record_tasks.append(task)
+                if result.error:
+                    logger.warning(f"Engine {name} failed: {result.error}")
+                elif not result.links:
+                    logger.warning(f"Engine {name} returned 0 results")
+                return result
             except asyncio.TimeoutError:
-                await record_failure(name)
+                took_ms = int((time.monotonic() - start) * 1000)
+                task = record_engine_attempt_async(name, False, 0, took_ms)
+                if task is not None:
+                    record_tasks.append(task)
                 logger.warning(f"Engine {name} timed out")
-                return EngineResult(name=name, links=[], error="timeout")
+                return EngineResult(name=name, links=[], error="timeout", took_ms=took_ms)
             except Exception as e:
-                await record_failure(name)
+                took_ms = int((time.monotonic() - start) * 1000)
+                task = record_engine_attempt_async(name, False, 0, took_ms)
+                if task is not None:
+                    record_tasks.append(task)
                 logger.warning(f"Engine {name} exception: {e}")
-                return EngineResult(name=name, links=[], error=str(e))
+                return EngineResult(name=name, links=[], error=str(e), took_ms=took_ms)
 
-        tasks = [run_engine(e) for e in SEARCH_ENGINES]
+        tasks = [run_engine(e) for e in active_engines]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        processed: list[EngineResult] = []
+        processed: list[EngineResult] = list(skipped_results)
         for r in results:
             if isinstance(r, Exception):
                 logger.warning(f"Engine task exception: {r}")
                 continue
             processed.append(r)
 
-        return processed
+    if record_tasks:
+        await asyncio.gather(*record_tasks, return_exceptions=True)
+
+    result_count = sum(len(r.links) for r in processed)
+    if allow_diversify and result_count < 5 and llm_client is not None and active_engines:
+        alternatives = await diversify_query(query, result_count, llm_client)
+        top_engines = active_engines[:3]
+        for alternative in alternatives[:2]:
+            processed.extend(
+                await _search_async(
+                    alternative,
+                    max_workers=min(max_workers, 3),
+                    llm_client=None,
+                    engines=top_engines,
+                    allow_diversify=False,
+                )
+            )
+
+    success_count = sum(1 for r in processed if r.error is None)
+    circuit_open_count = sum(1 for r in processed if r.error == "circuit_open")
+    total = len(engine_list)
+    final_count = sum(len(r.links) for r in processed)
+    _LAST_SEARCH_SUMMARY = {
+        "success": success_count,
+        "total": total,
+        "active": len(active_engines),
+        "circuits_open": circuit_open_count,
+        "results": final_count,
+    }
+    logger.info(
+        "Search complete: %d/%d engines, %d results, %d circuits open",
+        success_count,
+        total,
+        final_count,
+        circuit_open_count,
+    )
+    return processed
 
 
-def get_search_results_async(query: str, max_workers: int = MAX_CONCURRENT) -> list[dict]:
+def get_search_results_async(query: str, max_workers: int = MAX_CONCURRENT, llm_client=None) -> list[dict]:
     """Async search - call from async context."""
     import time
     start = time.monotonic()
 
-    results = run_async(_search_async(query, max_workers))
+    results = run_async(_search_async(query, max_workers, llm_client=llm_client))
 
     all_links = []
     for result in results:
@@ -332,3 +421,7 @@ def _dedupe_links(links: list[dict]) -> list[dict]:
 def get_search_results(query: str, max_workers: int = MAX_CONCURRENT) -> list[dict]:
     """Sync wrapper for backward compatibility."""
     return get_search_results_async(query, max_workers)
+
+
+def get_last_search_summary() -> dict[str, int]:
+    return dict(_LAST_SEARCH_SUMMARY)
