@@ -110,8 +110,8 @@ SCRAPINGANT_API_KEY = _clean_env("SCRAPINGANT_API_KEY", "")
 # or `datacenter`.  Read directly by sources/proxy_client.py via os.getenv;
 # defaults to "residential" if unset or any other value (the chokepoint
 # normalizes there).  Per https://docs.scrapingant.com/proxy-mode this is
-# passed as a `proxy_type=` parameter in the Proxy Mode username string
-# (built at connection time as "scrapingant&browser=false&proxy_type=...").
+# passed as a `proxy_type=` parameter in the proxy transport username string
+# (built at connection time as "the ScrapingAnt proxy username string").
 # This is a value, not a credential, so it stays a plain env var (no
 # UserApiKey registration on the API surface).
 SCRAPINGANT_PROXY_TYPE = _clean_env("SCRAPINGANT_PROXY_TYPE", "residential")
@@ -199,3 +199,6 @@ def validate_config():
 
 
 validate_config()
+
+
+

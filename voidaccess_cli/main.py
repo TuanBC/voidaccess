@@ -200,16 +200,19 @@ def status(
 
     # Phase 1.6 (corrected per architect review) — show the clearnet-routing
     # state.  Per https://docs.scrapingant.com/proxy-mode §Introduction
-    # ("Proxy Mode is a light front-end for the scraping API") the two
+    # ("the proxy transport is a light front-end for the scraping API") the two
     # transports are mutually exclusive alternates — there is no
     # combined "chained" state.  We delegate to the chokepoint's
     # transport selector so the display ALWAYS matches what
     # clearnet_fetch() will actually do.  Never reveals raw keys.
     #
     #   both off          → red    "disabled"           (direct — v1.5.0 behavior)
-    #   proxy only        → cyan   "Proxy Mode"         (HTTP CONNECT through proxy.scrapingant.com:8080)
+    #   proxy only        → cyan   "proxy transport"         (HTTP CONNECT through the configured ScrapingAnt proxy endpoint)
     #   api only          → green  "REST API"          (POST api.scrapingant.com/v2/general)
-    #   both on (proxy wins) → magenta "Proxy Mode (api would be overridden)"
+    #   both on (proxy wins) → magenta "proxy transport (api would be overridden)"
+    proxy_username = cfg.get("enrichment_keys", {}).get("SCRAPINGANT_PROXY_USERNAME", "")
+    proxy_password = cfg.get("enrichment_keys", {}).get("SCRAPINGANT_PROXY_PASSWORD", "")
+    proxy_ready = bool(proxy_username and proxy_password)
     from sources.proxy_client import (
         is_api_transport_enabled,
         is_proxy_transport_enabled,
@@ -218,19 +221,19 @@ def status(
     api_gate = is_api_transport_enabled()
     proxy_gate = is_proxy_transport_enabled()
     selected = select_transport()
-    if selected == "proxy":
+    if selected == "proxy" and proxy_ready:
         if api_gate:
-            routing_state = "[magenta]Proxy Mode (REST API overridden)[/magenta]"
-            routing_detail = "Proxy Mode transport; REST API gate was also on but proxy wins"
+            routing_state = "[magenta]proxy transport (REST API overridden)[/magenta]"
+            routing_detail = "proxy transport; REST API gate was also on but proxy wins"
         else:
-            routing_state = "[cyan]Proxy Mode[/cyan]"
-            routing_detail = "HTTP CONNECT through proxy.scrapingant.com:8080"
+            routing_state = "[cyan]proxy transport[/cyan]"
+            routing_detail = "HTTP CONNECT through the configured ScrapingAnt proxy endpoint"
     elif selected == "api":
         routing_state = "[green]REST API[/green]"
         routing_detail = "POST api.scrapingant.com/v2/general"
     else:
         routing_state = "[red]disabled[/red]"
-        routing_detail = "direct fetch (no ScrapingAnt)"
+        routing_detail = "direct fetch (no ScrapingAnt or missing proxy credentials)"
     table.add_row(
         "Clearnet routing",
         f"{routing_state} ({routing_detail}) — paste + RSS only, never Tor",
@@ -457,15 +460,38 @@ def show_banner(console: Console) -> None:
     if not sys.stdout.isatty() and "PS1" not in os.environ and os.name != "nt":
         return
     console.print()
-    # Center each line on its own visible width so the logo block, the
-    # "dark web osint intelligence" tagline, and the longer partner-banner
-    # lines all line up on the same vertical axis.  Pre-computing a single
-    # pad value (the old behaviour) only worked because the banner used
-    # to be a single fixed-width ASCII block; the partner-banner lines
-    # added in v1.6.0 are wider and need their own pad.
-    for line in BANNER.split("\n"):
-        visible = _banner_line_visible_width(line)
-        pad = max(0, (console.width - visible) // 2)
+    # v1.6.1 — center every line to the same vertical axis.
+    #
+    # The previous implementation centered each line independently on
+    # its own visible width — that *usually* worked but produced up to
+    # a half-column of horizontal drift between lines of odd vs even
+    # visible widths at certain terminal widths, because `(W - width) // 2`
+    # truncates when `W - width` is odd.  That drift was the "left-shifted"
+    # ScrapingAnt block seen in the v1.6.0 banner: its lines are wider
+    # than the circle above, so the integer-truncation rounding on its
+    # pads differed from the circle's pads by up to 0.5 column.
+    #
+    # The fix is to compute the center column of the widest line first,
+    # then pad every other line so its center lands on EXACTLY that same
+    # column.  Width and centering of the void circle are unchanged —
+    # this only re-routes the ScrapingAnt partnership block through the
+    # exact same centering logic that already centered the circle.
+    widths = [_banner_line_visible_width(line) for line in BANNER.split("\n")]
+    if not widths:
+        console.print()
+        return
+    max_width = max(widths)
+    # Center column for the widest line under integer padding.
+    max_pad = max(0, (console.width - max_width) // 2)
+    max_center = max_pad + max_width / 2.0
+    for line, width in zip(BANNER.split("\n"), widths):
+        # Pad such that this line's center matches max_center.
+        # `(max_center - width/2)` may be a fractional value; round to
+        # the nearest integer so the visible center is as close to
+        # max_center as integer padding allows.  Use `round()` (banker's
+        # rounding via Python's built-in) so .5 ties go to even.
+        raw_pad = max_center - width / 2.0
+        pad = max(0, int(round(raw_pad)))
         console.print(" " * pad + line)
     console.print()
 
@@ -486,3 +512,6 @@ def main(
 
 if __name__ == "__main__":
     app()
+
+
+

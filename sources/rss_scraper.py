@@ -173,6 +173,22 @@ RSS_FEEDS = [
         "tags": ["cybercrime", "ransomware", "darkweb", "arrest", "seizure", "takedown"],
         "weight": 9,
     },
+    # v1.6.1 — DOJ News (replacement for the permanently-404
+    # /news/press-releases/rss endpoint).  The DOJ restructured their
+    # Drupal site and the old press-releases-only RSS path now returns
+    # 404; the all-news feed at /news/rss is the working replacement and
+    # contains every DOJ press release (plus speeches, videos, etc.,
+    # filtered by relevance downstream).  Verified live 2026-07.
+    {
+        "name": "US Department of Justice News",
+        "url": "https://www.justice.gov/news/rss",
+        "category": "government",
+        "tags": [
+            "cybercrime", "ransomware", "fraud", "indictment", "takedown",
+            "seizure", "sanctions", "enforcement", "DOJ",
+        ],
+        "weight": 9,
+    },
     {
         "name": "Recorded Future Intelligence",
         "url": "https://www.recordedfuture.com/feed",
@@ -214,7 +230,16 @@ _KNOWN_ACTORS = [
 
 
 class RSSCache:
-    """Simple file-based cache for RSS feed article lists."""
+    """Simple file-based cache for RSS feed article lists.
+
+    v1.6.1 — also caches feed-FETCH failures (empty / 404 results) for
+    the cache TTL window, so a temporarily-broken feed URL is not
+    re-attempted on every investigation within the TTL.  Without this,
+    a dead feed URL in RSS_FEEDS would log the same failure on every
+    run until ops manually removed it.  Now: the FIRST run sees the
+    failure, every subsequent run within CACHE_TTL_SECONDS silently
+    skips the feed (no fetch, no log noise).
+    """
 
     def __init__(self):
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -224,6 +249,13 @@ class RSSCache:
         return CACHE_DIR / f"{key}.json"
 
     def get(self, url: str) -> Optional[list]:
+        """Return cached article list for *url*, or None on miss/expiry.
+
+        A return value of ``[]`` is the cache hit for a failed fetch —
+        callers should treat ``[]`` the same as a fresh empty result
+        (no fetch attempt, no log noise).  Returns None only when
+        there is no cache entry or the entry has expired.
+        """
         path = self._cache_path(url)
         if not path.exists():
             return None
@@ -238,6 +270,11 @@ class RSSCache:
             return None
 
     def set(self, url: str, articles: list) -> None:
+        """Persist the feed's article list (or empty list for failures)
+        for CACHE_TTL_SECONDS.  An empty list is the canonical
+        representation of a failed/empty feed fetch so subsequent
+        runs within the TTL window don't retry it.
+        """
         path = self._cache_path(url)
         try:
             path.write_text(json.dumps({
@@ -254,6 +291,20 @@ class RSSFeedScraper:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache = RSSCache()
+        # v1.6.1 — per-investigation article-fetch cache.  Same article
+        # URL appears in many feeds (CISA, FBI, etc. all link to the
+        # same parent landing pages) so without this the same URL was
+        # being re-fetched 15-17+ times per run, generating a 404 storm
+        # when the URL was dead (e.g. the old
+        # ``/cybersecurity-advisories/all.json`` and
+        # ``/news/press-releases/rss`` paths).  We cache BOTH successes
+        # (full text) AND failures (sentinel) so a broken URL is attempted
+        # exactly once per investigation, not once per article.  Lives
+        # only for the lifetime of this scraper instance (one per
+        # ``scrape_rss_feeds()`` call) — so it's per-investigation, not
+        # persistent across runs.  The sentinel value marks "we already
+        # tried this URL this run and it failed; don't try again".
+        self._article_fetch_cache: dict[str, object] = {}
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(
@@ -344,12 +395,20 @@ class RSSFeedScraper:
 
         cached = self._cache.get(feed_url)
         if cached is not None:
+            # v1.6.1 — cache covers both successes AND failures (cached
+            # as empty list).  A None-miss means the entry has expired
+            # or was never written; a non-None return is a cache hit
+            # (including the empty-list "this feed failed recently"
+            # sentinel).  Either way, do not re-fetch — that's the
+            # whole point of the negative-result cache.
             logger.debug("RSS cache hit: %s", feed_name)
             raw_articles = cached
         else:
             raw_articles = await self._fetch_and_parse(feed_url, feed_name)
-            if raw_articles:
-                self._cache.set(feed_url, raw_articles)
+            # v1.6.1 — cache the result either way: successes as the
+            # article list, failures as [] so the next run within the
+            # TTL window skips the fetch entirely (no log spam).
+            self._cache.set(feed_url, raw_articles or [])
 
         if not raw_articles:
             return []
@@ -501,9 +560,31 @@ class RSSFeedScraper:
         threshold preserved at ``MAX_ARTICLE_SIZE`` (now measured against
         the raw bytes returned by the chokepoint rather than the decoded
         text — the numeric threshold is unchanged).
+
+        v1.6.1 — per-investigation cache:
+        Consults ``self._article_fetch_cache`` first.  A cached entry (success
+        or ``None`` for failure) is returned immediately without a network
+        call, so the same article URL is fetched at most once per run.  The
+        same article appears in many feeds (CISA + FBI + government blogs
+        all link to the same landing pages) and a single dead URL (e.g. the
+        legacy ``/cybersecurity-advisories/all.json`` or
+        ``/news/press-releases/rss`` paths) used to trigger 15-17+ identical
+        fetches per run — now exactly one, with the rest served from cache.
         """
         if not url or not self._session:
             return None
+
+        # --- v1.6.1: per-run article cache check -------------------------
+        cached = self._article_fetch_cache.get(url)
+        if cached is not None:
+            # Either a real string (success — return text directly) or
+            # the sentinel "we already tried this URL and it returned
+            # None" entry.  We can't store a plain None because
+            # ``dict.get(url)`` would return None for both "not cached"
+            # and "cached as failure" — use a sentinel.
+            if cached is _ARTICLE_FETCH_SENTINEL:
+                return None
+            return cached
 
         # --- Belt-and-suspenders .onion guard -----------------------------
         if is_onion_url(url):
@@ -511,6 +592,7 @@ class RSSFeedScraper:
                 "RSS article URL is .onion — refusing clearnet fetch: %s",
                 url[:60],
             )
+            self._article_fetch_cache[url] = _ARTICLE_FETCH_SENTINEL
             return None
 
         try:
@@ -521,6 +603,7 @@ class RSSFeedScraper:
                 fallback_session=self._session,
             )
             if status != 200:
+                self._article_fetch_cache[url] = _ARTICLE_FETCH_SENTINEL
                 return None
             # Size gate now uses the real bytes received, not the decoded
             # text.  The threshold value (MAX_ARTICLE_SIZE) is unchanged;
@@ -530,8 +613,13 @@ class RSSFeedScraper:
                 body = body[:MAX_ARTICLE_SIZE]
             html = body.decode("utf-8", errors="ignore")
             text = self._extract_article_text(html)
-            return text if len(text) > 100 else None
+            if text and len(text) > 100:
+                self._article_fetch_cache[url] = text
+                return text
+            self._article_fetch_cache[url] = _ARTICLE_FETCH_SENTINEL
+            return None
         except Exception:
+            self._article_fetch_cache[url] = _ARTICLE_FETCH_SENTINEL
             return None
 
     def _extract_article_text(self, html: str) -> str:
@@ -602,6 +690,14 @@ class RSSFeedScraper:
                 score += 1
 
         return score
+
+
+# Module-level sentinel used in RSSFeedScraper._article_fetch_cache to
+# mark "we already tried this URL this run and it failed".  Real results
+# are stored as strings, so this unique object cleanly distinguishes
+# "not cached" from "cached as a failure" without a separate
+# sentinel-key namespace.
+_ARTICLE_FETCH_SENTINEL = object()
 
 
 async def scrape_rss_feeds(

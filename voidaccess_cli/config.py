@@ -37,15 +37,17 @@ ENRICHMENT_KEYS = [
     "DEEPL_API_KEY",
     "DARKSEARCH_API_KEY",
     # Phase 1.6 — optional clearnet proxy. The ONLY credential needed
-    # for either the REST API transport or Proxy Mode transport per
+    # for either the REST API transport or proxy transport per
     # https://docs.scrapingant.com/proxy-mode. Never touches Tor or
     # .onion traffic. Stored in the same enrichment_keys section as
     # every other optional key.
     "SCRAPINGANT_API_KEY",
+    "SCRAPINGANT_PROXY_USERNAME",
+    "SCRAPINGANT_PROXY_PASSWORD",
     # Phase 1.6 — proxy pool type.  Accepts "residential" (default) or
     # "datacenter".  Empty when the feature is unused; the chokepoint
     # defaults to "residential" if this is unset.  Per docs, this is
-    # passed as a `proxy_type=` parameter in the Proxy Mode username
+    # passed as a `proxy_type=` parameter in the proxy transport username
     # string, NOT as a separate hostname.
     "SCRAPINGANT_PROXY_TYPE",
 ]
@@ -84,9 +86,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         #                         correct, must not be touched.)
         #
         # use_proxy             → VOIDACCESS_USE_PROXY=true
-        #                         Selects the Proxy Mode transport.
+        #                         Selects the proxy transport.
         #                         Per docs (https://docs.scrapingant.com/
-        #                         proxy-mode §Introduction) Proxy Mode is
+        #                         proxy-mode §Introduction) proxy transport is
         #                         "a light front-end for the scraping API
         #                         and has all the same functionality and
         #                         performance as sending requests to the
@@ -292,7 +294,7 @@ def apply_env(config: Optional[dict[str, Any]] = None) -> None:
     # - features.use_proxies (legacy v1.5.0) → VOIDACCESS_USE_PROXIES=true
     #   Selects the REST API transport.
     # - features.use_proxy (new in v1.6.0)  → VOIDACCESS_USE_PROXY=true
-    #   Selects the Proxy Mode transport.
+    #   Selects the proxy transport.
     #
     # Each is set ONLY when the user has explicitly enabled it.  The
     # chokepoint reads these env vars AND SCRAPINGANT_API_KEY, so missing
@@ -314,3 +316,6 @@ def apply_env(config: Optional[dict[str, Any]] = None) -> None:
     for key in ("ABUSECH_API_KEY", "VT_API_KEY", "OTX_API_KEY"):
         if not (os.environ.get(key) or "").strip():
             os.environ.pop(key, None)
+
+
+

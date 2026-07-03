@@ -62,6 +62,7 @@ include = [
     "voidaccess_cli*",
     "db*",
     "sources*",
+    "sources.data*",
     "extractor*",
     "scraper*",
     "search*",
@@ -85,9 +86,25 @@ exclude = [
     "infra*",
     "chroma_db*",
     "cti_data*",
-    "data*",
     "docs*",
     "scripts*",
     "public*",
     "__pycache__*",
 ]
+
+# v1.6.1 — ship data/onion_seeds.json inside the installed package.
+# Without this entry, ``pip install voidaccess`` produces a package
+# directory that does NOT contain the curated seed list — every
+# CLI investigation silently gets zero seed injection, which is the
+# exact regression reported in v1.6.0 (every installed CLI logged
+# ``Seed file not found: .../site-packages/data/onion_seeds.json``).
+#
+# ``sources.data`` is declared as a sub-package above (its only file
+# is onion_seeds.json; __init__.py is empty) so importlib.resources
+# can locate it after pip install via
+# ``files('sources').joinpath('data', 'onion_seeds.json')``.  The
+# package-data entry below tells setuptools to ship the JSON inside
+# that sub-package directory.
+[tool.setuptools.package-data]
+"sources" = ["data/onion_seeds.json"]
+"sources.data" = ["onion_seeds.json"]

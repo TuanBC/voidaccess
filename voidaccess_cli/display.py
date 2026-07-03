@@ -2,9 +2,10 @@
 cli/display.py — Rich live display for investigations.
 
 Three-zone layout:
-    title bar     — query + elapsed timer
-    step table    — pipeline stages with status icons
-    activity line — current URL / sub-task detail
+    title bar            — query + elapsed timer
+    step table           — pipeline stages with status icons
+    rotating-proxies row — live indicator (blinking green when ON, solid red when OFF)
+    activity line        — current URL / sub-task detail
 
 Status icons:
     pending  · gray dot
@@ -12,6 +13,14 @@ Status icons:
     ok       ✓ green
     fail     ✗ red
     skip     ↷ yellow
+
+Rotating-proxies indicator:
+    The "Rotating proxies" row is rendered with the green dot using
+    Rich's blink style attribute when ON.  If the terminal does not
+    support blink rendering (most modern terminals render blink as
+    steady), the dot still appears as a solid green dot with "ON"
+    next to it.  The OFF state uses a solid red dot (no blink needed
+    because the OFF state is static).
 """
 
 from __future__ import annotations
@@ -60,6 +69,11 @@ class InvestigationDisplay:
         self._spinner_index = 0
         self._final_summary: Optional[dict] = None
         self._error: Optional[str] = None
+        # v1.6.1 — rotating-proxies indicator.  Set via set_proxy_state().
+        # When None, the row is omitted (back-compat: callers that never
+        # touch it keep the pre-v1.6.1 layout).  When set, the row is
+        # always present from the start of the run.
+        self._proxy_state: Optional[str] = None  # "on" | "off"
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -127,6 +141,19 @@ class InvestigationDisplay:
         self._current_url = url
         self._refresh()
 
+    def set_proxy_state(self, state: str) -> None:
+        """Toggle the live rotating-proxies indicator.
+
+        state: "on" (proxy transport active for this run) or "off".
+        Call this BEFORE display.start() if you want the row to be
+        present from the first refresh — otherwise call it any time
+        during the run and the row will appear/refresh.
+        """
+        if state not in ("on", "off"):
+            return
+        self._proxy_state = state
+        self._refresh()
+
     def complete(self, summary: dict) -> None:
         self._final_summary = summary
         self.stop()
@@ -149,6 +176,28 @@ class InvestigationDisplay:
             if row.name == name:
                 return row
         return None
+
+    def _render_proxy_row(self) -> Text:
+        """Render the "Rotating proxies" indicator row.
+
+        ON  → green dot with blink style + "ON"  (terminals that don't
+              support blink fall back to a plain solid green dot — never
+              breaks the display, blink is purely visual).
+        OFF → solid red dot (no blink; OFF is static so no need to animate).
+        """
+        line = Text()
+        if self._proxy_state == "on":
+            # Blink attribute: Rich translates to ANSI 5 (blink) on
+            # terminals that support it.  On terminals that don't (most
+            # modern terminals render blink as a steady color or ignore
+            # it entirely), the dot still renders as a solid green dot
+            # because we also pass color="green" — never breaks display.
+            line.append("● ", style="blink bold green")
+            line.append("ON", style="bold green")
+        else:
+            line.append("● ", style="red")
+            line.append("OFF", style="bold red")
+        return line
 
     def _render(self) -> Panel:
         elapsed = time.monotonic() - self._start_ts
@@ -175,6 +224,15 @@ class InvestigationDisplay:
                 sub = Text(f"   {sg} {sub_label}", style=sc)
                 table.add_row("", sub)
 
+        # v1.6.1 — rotating-proxies indicator row, present from the start
+        # of the run, so the user sees it while scraping is actually
+        # happening (not just appended at the end).
+        if self._proxy_state is not None:
+            label = Text()
+            label.append("Rotating proxies  ", style="white")
+            label.append(self._render_proxy_row())
+            table.add_row("", label)
+
         activity = Text()
         if self._current_url:
             activity.append("Fetching: ", style="bold")
@@ -194,6 +252,39 @@ class InvestigationDisplay:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold")
         table.add_column()
+
+        # v1.6.1 — "Rotating proxies" line.  This is the actual verifiable
+        # proof the user asked for, drawn from the per-run counters in
+        # sources.proxy_client, not just a static enabled/disabled label.
+        # Summary passes "proxy_summary": {"state": "on"|"off",
+        # "via_proxy": int, "fallback": int} — see _run_investigation.
+        proxy_summary = summary.get("proxy_summary") or {}
+        proxy_state = proxy_summary.get("state", "off")
+        if proxy_state == "on":
+            via_proxy = int(proxy_summary.get("via_proxy", 0))
+            fallback = int(proxy_summary.get("fallback", 0))
+            if via_proxy > 0:
+                row_text = (
+                    f"[green]\u25cf ON[/green]  "
+                    f"([bold]{via_proxy}[/bold] via proxy, "
+                    f"[bold]{fallback}[/bold] fallback to direct)"
+                )
+            else:
+                # Proxies were ON for this run but every attempt failed
+                # and fell back.  Show the diagnostic hint so the user
+                # doesn't silently think everything is fine — a "proxies
+                # on but zero successes" state almost always means a bad
+                # or missing proxy credentials and the user deserves to know.
+                row_text = (
+                    f"[yellow]\u25cf ON[/yellow]  "
+                    f"([bold]0[/bold] via proxy, "
+                    f"[bold]{fallback}[/bold] fallback to direct "
+                    f"\u2014 check your proxy username/password)"
+                )
+        else:
+            row_text = "[red]\u25cf OFF[/red]"
+        table.add_row("Rotating Proxies", row_text)
+
         table.add_row("Entities", str(summary.get("entity_count", "—")))
         table.add_row("Pages", str(summary.get("page_count", "—")))
         if "c2_ips" in summary:
@@ -210,3 +301,5 @@ class InvestigationDisplay:
             padding=(1, 2),
         )
         self.console.print(panel)
+
+

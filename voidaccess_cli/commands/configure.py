@@ -32,6 +32,8 @@ console = Console()
 # here so the entire proxy config lives in one uninterrupted block.
 KEYS_WITH_DEDICATED_STEP = {
     "SCRAPINGANT_API_KEY",
+    "SCRAPINGANT_PROXY_USERNAME",
+    "SCRAPINGANT_PROXY_PASSWORD",
     "SCRAPINGANT_PROXY_TYPE",
 }
 
@@ -152,15 +154,15 @@ def _prompt_scrapingant(cfg: dict) -> None:
     RSS feeds ONLY, and it never touches Tor/.onion traffic.
 
     Per https://docs.scrapingant.com/proxy-mode §Integration details,
-    the ONLY real credential is SCRAPINGANT_API_KEY. The username
-    string for Proxy Mode is built at connection time as
-    "scrapingant&browser=false&proxy_type=residential|datacenter" —
+    the primary ScrapingAnt credential is SCRAPINGANT_API_KEY. The username
+    string for proxy transport is built at connection time as
+    "the ScrapingAnt proxy username string with browser=false and proxy_type" —
     "scrapingant" is a literal constant, not a per-customer value.
     SCRAPINGANT_PROXY_TYPE selects residential vs datacenter as a
     username parameter, NOT as a different hostname.
 
     The two transport toggles (API / Proxy) are mutually exclusive
-    alternates per the docs (Proxy Mode is "a light front-end for the
+    alternates per the docs (proxy transport is "a light front-end for the
     scraping API"); we ask about each separately but they cannot be
     combined.
     """
@@ -168,7 +170,7 @@ def _prompt_scrapingant(cfg: dict) -> None:
     console.print(
         "  Routes [cyan]clearnet scraping only[/cyan] — paste sites (Pastebin, "
         "dpaste, Rentry) and RSS feeds (Krebs, BleepingComputer, Talos, etc.) "
-        "through ScrapingAnt's Web Scraping API or Proxy Mode to improve reliability."
+        "through ScrapingAnt's Web Scraping API or proxy transport to improve reliability."
     )
     console.print(
         "  [yellow]Never touches Tor traffic.[/yellow] Dark web and .onion fetches "
@@ -193,9 +195,29 @@ def _prompt_scrapingant(cfg: dict) -> None:
     )
     cfg["enrichment_keys"]["SCRAPINGANT_API_KEY"] = new_key.strip()
 
+    console.print(
+        "  [dim]Residential proxies use a separate username/password pair from the ScrapingAnt dashboard.[/dim]"
+    )
+    existing_username = cfg["enrichment_keys"].get("SCRAPINGANT_PROXY_USERNAME", "")
+    new_username = Prompt.ask(
+        "  SCRAPINGANT_PROXY_USERNAME",
+        default=existing_username or "",
+        show_default=False,
+    )
+    cfg["enrichment_keys"]["SCRAPINGANT_PROXY_USERNAME"] = new_username.strip()
+
+    existing_password = cfg["enrichment_keys"].get("SCRAPINGANT_PROXY_PASSWORD", "")
+    new_password = Prompt.ask(
+        "  SCRAPINGANT_PROXY_PASSWORD",
+        default=existing_password or "",
+        show_default=False,
+        password=True,
+    )
+    cfg["enrichment_keys"]["SCRAPINGANT_PROXY_PASSWORD"] = new_password.strip()
+
     # --- SCRAPINGANT_PROXY_TYPE (residential default; datacenter for higher bandwidth) ---
-    # Per docs, this is passed as `proxy_type=` in the Proxy Mode
-    # username string.  Only meaningful when the Proxy Mode transport
+    # Per docs, this is passed as `proxy_type=` in the proxy transport
+    # username string.  Only meaningful when the proxy transport
     # is selected; ignored otherwise.
     existing_type = (
         cfg["enrichment_keys"].get("SCRAPINGANT_PROXY_TYPE", "") or "residential"
@@ -231,7 +253,7 @@ def _prompt_scrapingant(cfg: dict) -> None:
 
         current_proxy = bool(cfg.get("features", {}).get("use_proxy", False))
         if Confirm.ask(
-            f"  Enable Proxy Mode transport (HTTP CONNECT through proxy.scrapingant.com:8080, "
+            f"  Enable proxy transport (HTTP CONNECT through the configured ScrapingAnt proxy endpoint, "
             f"{new_type} pool) for clearnet scrapes?",
             default=current_proxy,
         ):
@@ -317,7 +339,7 @@ def configure_proxy(
     enable_proxy: Optional[bool] = typer.Option(
         None,
         "--enable-proxy/--disable-proxy",
-        help="Enable or disable the Proxy Mode transport (HTTP CONNECT through proxy.scrapingant.com:8080).",
+        help="Enable or disable the proxy transport (HTTP CONNECT through the configured ScrapingAnt proxy endpoint).",
     ),
     show: bool = typer.Option(
         False,
@@ -329,14 +351,14 @@ def configure_proxy(
 
     With no flags, runs the interactive prompt.  With --enable / --disable,
     sets the REST API transport toggle non-interactively (legacy v1.5.0
-    flag).  With --enable-proxy / --disable-proxy, sets the Proxy Mode
+    flag).  With --enable-proxy / --disable-proxy, sets the proxy transport
     transport toggle (new in v1.6.0 — requires SCRAPINGANT_API_KEY to
     actually activate).
 
     The two transports are MUTUALLY EXCLUSIVE alternates per
-    https://docs.scrapingant.com/proxy-mode §Introduction ("Proxy Mode
+    https://docs.scrapingant.com/proxy-mode §Introduction ("proxy transport
     is a light front-end for the scraping API"). Setting one does not
-    enable the other; if both are set, the chokepoint picks Proxy Mode
+    enable the other; if both are set, the chokepoint picks proxy transport
     and emits a one-shot info log.
 
     Clearnet scraping only — Tor and .onion traffic are never affected.
@@ -346,6 +368,8 @@ def configure_proxy(
     # --show: display current state with the key masked, and exit.
     if show and enable is None and enable_proxy is None:
         key = cfg.get("enrichment_keys", {}).get("SCRAPINGANT_API_KEY", "")
+        proxy_username = cfg.get("enrichment_keys", {}).get("SCRAPINGANT_PROXY_USERNAME", "")
+        proxy_password = cfg.get("enrichment_keys", {}).get("SCRAPINGANT_PROXY_PASSWORD", "")
         proxy_type = (
             cfg.get("enrichment_keys", {}).get("SCRAPINGANT_PROXY_TYPE", "") or "—"
         )
@@ -358,21 +382,29 @@ def configure_proxy(
 
         console.print("  [bold]ScrapingAnt proxy[/bold]")
         console.print(f"  Key             : {masked_key}")
+        masked_username = (
+            f"{proxy_username[:4]}…{proxy_username[-4:]}" if len(proxy_username) > 8 else ("set" if proxy_username else "—")
+        )
+        console.print(f"  Proxy username  : {masked_username}")
+        console.print(f"  Proxy password  : {'set' if proxy_password else '—'}")
         console.print(f"  Pool type       : {proxy_type}")
         api_label = "[green]enabled[/green]" if api_transport else "[red]disabled[/red]"
         proxy_label = "[green]enabled[/green]" if proxy_transport else "[red]disabled[/red]"
         console.print(f"  API transport   : {api_label}")
         console.print(f"  Proxy transport : {proxy_label}")
         console.print("  Scope           : paste + RSS only, never Tor")
-        if (api_transport or proxy_transport) and not key:
+        if proxy_transport and (not proxy_username or not proxy_password):
             console.print(
-                "  [yellow]Note:[/yellow] a transport is enabled but no SCRAPINGANT_API_KEY "
-                "is set — both transports will stay inactive until a key is provided."
+                "  [yellow]Note:[/yellow] proxy transport is enabled but the residential proxy username/password pair is incomplete — proxy transport will stay inactive until both values are provided."
+            )
+        if api_transport and not key:
+            console.print(
+                "  [yellow]Note:[/yellow] the REST API transport is enabled but no SCRAPINGANT_API_KEY is set yet."
             )
         if api_transport and proxy_transport:
             console.print(
                 "  [yellow]Note:[/yellow] both transports are enabled. They are mutually "
-                "exclusive alternates; the chokepoint picks Proxy Mode at runtime."
+                "exclusive alternates; the chokepoint picks proxy transport at runtime."
             )
         return
 
@@ -393,7 +425,7 @@ def configure_proxy(
         cfg.setdefault("features", {})["use_proxy"] = bool(enable_proxy)
         cli_config.save_config(cfg)
         state = "enabled" if enable_proxy else "disabled"
-        console.print(f"ScrapingAnt Proxy Mode transport [green]{state}[/green]")
+        console.print(f"ScrapingAnt proxy transport [green]{state}[/green]")
         if enable_proxy and not cfg.get("enrichment_keys", {}).get("SCRAPINGANT_API_KEY"):
             console.print(
                 "[yellow]Note:[/yellow] no SCRAPINGANT_API_KEY configured yet — "
@@ -406,3 +438,7 @@ def configure_proxy(
     _prompt_scrapingant(cfg)
     cli_config.save_config(cfg)
     console.print(f"[green]Saved to[/green] {cli_config.CONFIG_PATH}")
+
+
+
+

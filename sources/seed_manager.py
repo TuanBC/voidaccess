@@ -11,7 +11,25 @@ relevant entries.  Those seed URLs are injected into the scrape queue
 ahead of the search-engine fan-out so that known intelligence sources are
 always visited for an applicable query.
 
-The seed JSON lives at data/onion_seeds.json and is community-editable.
+Seed file resolution (v1.6.1):
+The seed JSON ships INSIDE the installed Python package under
+``sources/data/onion_seeds.json`` so it's present after
+``pip install voidaccess``.  We resolve the file via ``importlib.resources``
+which works in BOTH pip-installed and local-git-checkout environments:
+
+  - pip-installed: ``sources.data.onion_seeds.json`` (a sub-package whose
+    __init__ is empty and whose only file is onion_seeds.json).  Resolved
+    by importlib without touching the filesystem path.
+  - local checkout: importlib finds the same package via sys.path, and
+    the file is served straight from the working tree.  No separate
+    "dev mode" code path needed.
+
+The previous implementation used
+``Path(__file__).resolve().parent.parent / "data" / "onion_seeds.json"``
+which works in a git checkout but silently fails in a pip install
+because ``<site-packages>/data/`` does not exist.  That produced the
+"Seed file not found: .../site-packages/data/onion_seeds.json" WARNING
+every CLI user saw in v1.6.0.
 """
 
 from __future__ import annotations
@@ -31,9 +49,82 @@ from utils.content_safety import is_blocked_url
 
 logger = logging.getLogger(__name__)
 
-# The seed file lives in voidaccess/data/onion_seeds.json (sibling of sources/)
-SEED_FILE = Path(__file__).resolve().parent.parent / "data" / "onion_seeds.json"
+# Back-compat shim — pre-v1.6.1 callers (and the seed_manager's own
+# legacy code) sometimes reference SEED_FILE directly.  We populate it
+# lazily so any module that reads it during import gets the correct,
+# installed-package-aware path on first access (not the import-time
+# v1.6.0-broken sibling-of-sources/ path).
+def _resolve_seed_file() -> Path:
+    """Return the on-disk path to data/onion_seeds.json, robust to both
+    pip-installed and local-checkout invocations.
+
+    Order of resolution:
+      1. ``importlib.resources`` against the ``sources.data`` sub-package
+         that ships inside the installed wheel.  Works for pip installs.
+      2. Walk up from this file looking for ``data/onion_seeds.json`` in
+         any parent directory.  Works for local git checkouts where the
+         ``sources.data`` sub-package is not importable (it only exists
+         when the wheel was built with the new package-data layout).
+      3. Fall back to the original v1.6.0-broken sibling-of-sources/
+         path so we still get a clear WARNING rather than a hard crash
+         if neither path resolves (developer-mode, half-installed env, …).
+    """
+    # 1. importlib.resources against the installed sub-package.
+    try:
+        from importlib.resources import files as _files
+        candidate = _files("sources").joinpath("data", "onion_seeds.json")
+        if candidate.is_file():
+            # Convert Traversable to a real Path so callers that
+            # expect a Path (file open, .read_text, etc.) work.
+            return Path(str(candidate))
+    except Exception as exc:
+        logger.debug("importlib.resources lookup for sources.data.onion_seeds failed: %s", exc)
+
+    # 2. Walk up from this file's directory looking for data/onion_seeds.json.
+    here = Path(__file__).resolve()
+    for ancestor in here.parents:
+        candidate = ancestor / "data" / "onion_seeds.json"
+        if candidate.is_file():
+            return candidate
+
+    # 3. Original v1.6.0 path — sibling of sources/.  Will not exist in
+    # a clean pip install, but we surface a clear WARNING rather than
+    # raising so callers can degrade gracefully.
+    legacy = here.parent.parent / "data" / "onion_seeds.json"
+    return legacy
+
+
+def _get_seed_file() -> Path:
+    """Memoized accessor for SEED_FILE — keeps SEED_FILE semantics for
+    any caller that imports the symbol, but resolves it on first access
+    so the resolution logic above has a chance to find the installed
+    file instead of the legacy sibling-of-sources/ path.
+    """
+    global SEED_FILE
+    if SEED_FILE is None:
+        SEED_FILE = _resolve_seed_file()
+    return SEED_FILE
+
+
+SEED_FILE: Optional[Path] = None
+
 TOR_PROXY = "socks5://127.0.0.1:9050"
+
+
+def _read_seed_bytes() -> bytes:
+    """Read the seed JSON from whichever install location it's in."""
+    # Try the installed package first (importlib.resources).
+    try:
+        from importlib.resources import files as _files
+        candidate = _files("sources").joinpath("data", "onion_seeds.json")
+        if candidate.is_file():
+            return candidate.read_bytes()
+    except Exception:
+        pass
+    # Fall back to the resolved Path.  Use the memoized accessor so any
+    # caller-visible SEED_FILE reflects the correct path on first read.
+    path = _get_seed_file()
+    return path.read_bytes()
 
 
 class SeedManager:
@@ -48,14 +139,15 @@ class SeedManager:
 
     def load(self) -> None:
         """Load seeds from JSON file."""
-        if not SEED_FILE.exists():
-            logger.warning("Seed file not found: %s", SEED_FILE)
+        seed_path = _get_seed_file()
+        if not seed_path.exists():
+            logger.warning("Seed file not found: %s", seed_path)
             self._seeds = []
             self._loaded = True
             return
 
         try:
-            data = json.loads(SEED_FILE.read_text(encoding="utf-8"))
+            data = json.loads(_read_seed_bytes().decode("utf-8"))
             self._seeds = []
 
             for category, cat_data in data.get("categories", {}).items():
@@ -69,7 +161,7 @@ class SeedManager:
             logger.info(
                 "Loaded %d seeds from %s",
                 len(self._seeds),
-                SEED_FILE,
+                seed_path,
             )
             self._loaded = True
 
@@ -409,9 +501,10 @@ class SeedManager:
 
     def _load_raw(self) -> dict:
         """Load the on-disk file structure (preserving category metadata)."""
-        if SEED_FILE.exists():
+        seed_path = _get_seed_file()
+        if seed_path.exists():
             try:
-                return json.loads(SEED_FILE.read_text(encoding="utf-8"))
+                return json.loads(_read_seed_bytes().decode("utf-8"))
             except Exception as e:
                 logger.warning("Could not parse existing seed file: %s", e)
         return {
@@ -442,7 +535,8 @@ class SeedManager:
                         seed["last_seen"] = in_mem["last_seen"]
 
             data["last_updated"] = datetime.now(timezone.utc).date().isoformat()
-            SEED_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            seed_path = _get_seed_file()
+            seed_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as e:
             logger.error("Failed to save seed status updates: %s", e)
 
@@ -485,7 +579,8 @@ class SeedManager:
                         existing_urls.add(s["url"])
 
             data["last_updated"] = datetime.now(timezone.utc).date().isoformat()
-            SEED_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            seed_path = _get_seed_file()
+            seed_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as e:
             logger.error("Failed to save seeds: %s", e)
 

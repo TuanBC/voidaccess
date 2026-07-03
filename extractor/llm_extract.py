@@ -191,6 +191,31 @@ async def extract_with_llm(
     - Invalid JSON from the LLM is logged as a warning; that chunk contributes
       no results rather than raising.
     - Never raises.
+
+    Streaming-output suppression (v1.6.1):
+    Each chunk's LLM call goes through ``await llm.ainvoke(prompt)``.  The
+    LangChain model is configured with ``streaming=True`` and a
+    ``BufferedStreamingHandler`` callback that ``print()``s every ~60 chars
+    of the streamed response to stdout.  During extraction that callback
+    prints raw LLM tokens (including partial JSON objects) directly to the
+    user's terminal at every chunk boundary — which, for the user, looks
+    like the ``{"crypto_w {"threat_actor"...`` corruption signature
+    reported in v1.6.0.
+
+    The chunk-merge logic itself is correct: each chunk's raw response is
+    parsed independently via ``json.loads`` with markdown-fence stripping,
+    and any chunk that fails to parse is skipped (logged at WARNING) —
+    raw chunk strings are NEVER concatenated before parsing.  The visible
+    "garbled JSON" is purely the streaming callback dumping tokens to
+    stdout, not a merge bug.
+
+    Fix: route every chunk's ``ainvoke`` call through a per-extraction
+    callback override that suppresses the global streaming handler's
+    stdout prints.  We do this by attaching a no-op callback to each
+    call via LangChain's ``config`` argument — this *adds* a callback for
+    that call only, leaving the model's default callbacks intact for
+    other code paths (refine_query / filter_results / generate_summary
+    still stream as before — only extraction is silenced).
     """
     if llm is None:
         return existing_entities
@@ -363,10 +388,50 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
 
 
 async def _extract_chunk(chunk: str, llm) -> str:
-    """Send one chunk to LLM and return raw response content. Returns '' on error."""
+    """Send one chunk to LLM and return raw response content. Returns '' on error.
+
+    v1.6.1 — streaming-output suppression.
+    ``llm`` was instantiated with ``streaming=True`` and a
+    ``BufferedStreamingHandler`` callback that ``print()``s every ~60 chars
+    of the streamed response to stdout.  During extraction that callback
+    would dump raw LLM tokens (including partial JSON objects) directly
+    to the user's terminal — producing the "garbled JSON fragments" that
+    were being attributed to a chunk-merge bug.
+
+    We override the per-call callback config with a no-op handler so the
+    global streaming handler's stdout prints are silenced for THIS call
+    only.  Other LangChain invocations (refine_query, filter_results,
+    generate_summary) keep their streaming output unchanged.
+    """
     try:
+        from langchain_core.callbacks import BaseCallbackHandler
+
+        class _SilentHandler(BaseCallbackHandler):
+            """No-op callback that suppresses the streaming handler's stdout
+            prints for this single extraction call.  Every hook is a
+            no-op; we only care about preventing the parent's stdout
+            noise — we still want ``ainvoke`` to return the full response
+            content as before, just without the per-token terminal spam.
+            """
+
+            def on_llm_new_token(self, token: str, **kwargs) -> None:  # noqa: D401
+                return None
+
+            def on_llm_end(self, response, **kwargs) -> None:  # noqa: D401
+                return None
+
+            def on_llm_error(self, error, **kwargs) -> None:  # noqa: D401
+                return None
+
         prompt = _PROMPT_TEMPLATE.format(chunk=chunk)
-        response = await llm.ainvoke(prompt)
+        # Note: LangChain merges this callback config with the runnable's
+        # default callbacks for THIS call only.  Default callbacks on
+        # other call sites (refine_query, filter_results, summary) are
+        # not affected.
+        response = await llm.ainvoke(
+            prompt,
+            config={"callbacks": [_SilentHandler()]},
+        )
         content = response.content if hasattr(response, "content") else str(response)
         return content.strip()
     except Exception as exc:

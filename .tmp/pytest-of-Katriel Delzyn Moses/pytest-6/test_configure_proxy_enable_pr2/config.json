@@ -1,0 +1,38 @@
+{
+  "enrichment_keys": {
+    "ABUSEIPDB_API_KEY": "",
+    "BLOCKCYPHER_TOKEN": "",
+    "DARKSEARCH_API_KEY": "",
+    "DEEPL_API_KEY": "",
+    "EMAILREP_API_KEY": "",
+    "ETHERSCAN_API_KEY": "",
+    "GITHUB_TOKEN": "",
+    "GITLAB_TOKEN": "",
+    "GREYNOISE_API_KEY": "",
+    "HIBP_API_KEY": "",
+    "HYBRID_ANALYSIS_API_KEY": "",
+    "OTX_API_KEY": "",
+    "SCRAPINGANT_API_KEY": "abcdefgh12345678",
+    "SCRAPINGANT_PROXY_PASSWORD": "",
+    "SCRAPINGANT_PROXY_TYPE": "",
+    "SCRAPINGANT_PROXY_USERNAME": "",
+    "SECURITYTRAILS_API_KEY": "",
+    "SHODAN_API_KEY": "",
+    "URLSCAN_API_KEY": "",
+    "VT_API_KEY": ""
+  },
+  "features": {
+    "use_proxies": false,
+    "use_proxy": true
+  },
+  "llm": {
+    "api_key": "",
+    "model": "openrouter/deepseek/deepseek-chat",
+    "provider": "openrouter"
+  },
+  "output_dir": "C:\\Users\\Katriel Delzyn Moses\\.voidaccess\\results",
+  "tor": {
+    "host": "127.0.0.1",
+    "port": 9050
+  }
+}

@@ -810,10 +810,9 @@ _save_enrich_key "EMAILREP_API_KEY" "$EMAILREP_KEY"
 # boolean toggle alongside a key — a saved key with the toggle off
 # is the same as not configuring the feature at all.
 #
-# Phase 1.6 — also asks for the proxy pool type and two independent
-# transport toggles.  These are only needed if the user wants the Web
-# Scraping API path and/or rotating residential/datacenter Proxy Mode
-# path.  Skip-by-default keeps "no behavior change" as the default.
+# Phase 2 — asks for the residential proxy username/password pair and
+# the proxy pool type.  These are separate from the Web Scraping API
+# key above.  Skip-by-default keeps "no behavior change" as the default.
 printf "\n${DIM}  ── Clearnet Scraping Proxy ───────────${NC}\n\n"
 
 # ── Partnership banner ─────────────────────────────────────────────────
@@ -847,12 +846,31 @@ if [ -n "$SCRAPINGANT_KEY" ]; then
         print_ok "ScrapingAnt key valid"
         _enrich_configured=$(( _enrich_configured + 1 ))
 
+        printf "\n"
+        printf "  ${CYAN}▸${NC}  Residential proxy username (separate ScrapingAnt Residential Proxies credential) ${DIM}(press Enter to skip)${NC}: "
+        read -r SCRAPINGANT_PROXY_USERNAME || SCRAPINGANT_PROXY_USERNAME=""
+        if [ -n "$SCRAPINGANT_PROXY_USERNAME" ]; then
+            env_update "SCRAPINGANT_PROXY_USERNAME" "$SCRAPINGANT_PROXY_USERNAME"
+            print_ok "Proxy username saved"
+        else
+            print_info "Proxy username skipped"
+        fi
+
+        printf "\n"
+        printf "  ${CYAN}▸${NC}  Residential proxy password (separate from API key) ${DIM}(press Enter to skip)${NC}: "
+        read -rs SCRAPINGANT_PROXY_PASSWORD || SCRAPINGANT_PROXY_PASSWORD=""
+        printf "\n"
+        if [ -n "$SCRAPINGANT_PROXY_PASSWORD" ]; then
+            env_update "SCRAPINGANT_PROXY_PASSWORD" "$SCRAPINGANT_PROXY_PASSWORD"
+            print_ok "Proxy password saved"
+        else
+            print_info "Proxy password skipped"
+        fi
+
         # --- SCRAPINGANT_PROXY_TYPE (residential default, datacenter for higher bandwidth) ---
-        # Per https://docs.scrapingant.com/proxy-mode this is passed as a
-        # `proxy_type=` parameter in the Proxy Mode username string (which
-        # is built at connection time as "scrapingant&browser=false&proxy_type=...").
-        # It is NOT a per-customer credential and there is NO proxy-username
-        # field to ask for.
+        # The residential proxy username/password pair above is separate
+        # from the Web Scraping API key.  The host used for the residential
+        # proxy transport is residential.scrapingant.com:8080.
         printf "\n"
         printf "  ${CYAN}▸${NC}  Proxy pool type [${BOLD}residential${NC}/datacenter] ${DIM}(press Enter for residential)${NC}: "
         read -r SCRAPINGANT_PROXY_TYPE || SCRAPINGANT_PROXY_TYPE=""
@@ -869,13 +887,11 @@ if [ -n "$SCRAPINGANT_KEY" ]; then
         esac
 
         # --- Transport toggles ---
-        # The two ScrapingAnt transports (REST API vs Proxy Mode via
-        # proxy.scrapingant.com:8080) are MUTUALLY EXCLUSIVE alternates
-        # per https://docs.scrapingant.com/proxy-mode §Introduction —
-        # "Proxy Mode is a light front-end for the scraping API and has
-        # all the same functionality and performance." We ask about each
-        # separately; enabling both means the chokepoint picks Proxy
-        # Mode at runtime (logged with a one-shot info message).
+        # The two ScrapingAnt transports (REST API vs residential proxy
+        # transport via residential.scrapingant.com:8080) are MUTUALLY EXCLUSIVE alternates.
+        # We ask about each separately; enabling both means the chokepoint
+        # picks the residential proxy transport at runtime (logged with a
+        # one-shot info message).
         printf "\n"
         printf "  ${CYAN}▸${NC}  Enable REST API transport (ScrapingAnt Web Scraping API) for paste + RSS scrapes? [y/${BOLD}N${NC}]: "
         read -r api_ans || api_ans="n"
@@ -889,15 +905,15 @@ if [ -n "$SCRAPINGANT_KEY" ]; then
         fi
 
         printf "\n"
-        printf "  ${CYAN}▸${NC}  Enable Proxy Mode transport (HTTP CONNECT through proxy.scrapingant.com:8080, ${SCRAPINGANT_PROXY_TYPE,,} pool) for paste + RSS scrapes? [y/${BOLD}N${NC}]: "
+        printf "  ${CYAN}▸${NC}  Enable residential proxy transport (HTTP CONNECT through residential.scrapingant.com:8080 using the username/password above, ${SCRAPINGANT_PROXY_TYPE,,} pool) for paste + RSS scrapes? [y/${BOLD}N${NC}]: "
         read -r proxy_ans || proxy_ans="n"
         proxy_ans="${proxy_ans:-n}"
         if [[ "${proxy_ans,,}" == "y" ]]; then
             env_update "VOIDACCESS_USE_PROXY" "true"
-            print_ok "Proxy Mode transport enabled (paste + RSS only — never Tor)"
+            print_ok "Residential proxy transport enabled (paste + RSS only — never Tor)"
         else
             env_update "VOIDACCESS_USE_PROXY" "false"
-            print_info "Proxy Mode transport disabled — enable later by uncommenting VOIDACCESS_USE_PROXY=true in .env"
+            print_info "Residential proxy transport disabled — enable later by uncommenting VOIDACCESS_USE_PROXY=true in .env"
         fi
     else
         print_warn "Key test failed (HTTP $HTTP_CODE)"

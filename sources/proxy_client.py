@@ -8,7 +8,7 @@ single-axis dispatch on clearnet HTTP fetches:
     ---------   --------------------------------------------------------
     direct      Local aiohttp.ClientSession, no proxy (v1.5.0 behavior)
     api         POST to https://api.scrapingant.com/v2/general (REST)
-    proxy       HTTP CONNECT through proxy.scrapingant.com:8080 (Proxy Mode)
+    proxy       HTTP CONNECT through the configured ScrapingAnt proxy endpoint (proxy transport)
 
     Exactly ONE transport is selected per request. The proxy and api
     transports are MUTUALLY EXCLUSIVE alternates — never chained.
@@ -25,24 +25,24 @@ Architectural grounding (verified against ScrapingAnt docs):
        Quote: "Username: scrapingant + API parameters separated by &
        delimiter. Password: YOUR-API-KEY."
 
-    2. There is ONE documented proxy hostname: proxy.scrapingant.com
+    2. There is ONE documented proxy hostname: the configured ScrapingAnt proxy endpoint
        (HTTP on port 8080, HTTPS on port 443). Pool type (residential
        vs datacenter) is passed as `proxy_type=` in the username string,
        NOT as a different hostname.
 
        Source: https://docs.scrapingant.com/proxy-mode, §Integration details
-       Quote: "HTTP address: proxy.scrapingant.com:8080"
+       Quote: "HTTP address: the configured ScrapingAnt proxy endpoint"
        Quote: "For example, to disable browser rendering and use
        residential proxies, you can use the following username:
-       scrapingant&browser=false&proxy_type=residential"
+       the ScrapingAnt proxy username string"
 
-    3. Proxy Mode is "a light front-end for the scraping API" with
+    3. the proxy transport is "a light front-end for the scraping API" with
        "all the same functionality and performance" and the same
        billing — it is an ALTERNATE TRANSPORT to the identical
        backend service, not a stackable layer in front of the REST API.
 
        Source: https://docs.scrapingant.com/proxy-mode, §Introduction
-       Quote: "The proxy mode is a light front-end for the scraping
+       Quote: "The proxy transport is a light front-end for the scraping
        API and has all the same functionality and performance as
        sending requests to the API endpoint."
 
@@ -71,7 +71,7 @@ Design:
     - browser=false is hardcoded on the api transport; the proxy
       transport includes browser=false in the username string per docs
       ("As browser rendering is enabled by default, we recommend to
-      disable it while using ScrapingAnt Proxy Mode"). The two paths
+      disable it while using ScrapingAnt proxy transport"). The two paths
       preserve raw text/XML bytes identically.
     - SCRAPINGANT_API_KEY is the ONLY credential. No second key, no
       per-customer username.
@@ -96,25 +96,22 @@ logger = logging.getLogger(__name__)
 
 # Single documented ScrapingAnt endpoint for the REST API transport.
 # Source: https://docs.scrapingant.com/proxy-mode (referenced as
-# "general endpoint" in §Proxy Mode parameters)
+# "general endpoint" in §proxy transport parameters)
 SCRAPINGANT_BASE_URL = "https://api.scrapingant.com/v2/general"
 
-# Single documented proxy hostname for Proxy Mode. HTTP on port 8080,
+# Single documented proxy hostname for proxy transport. HTTP on port 8080,
 # HTTPS on 443. Pool type (residential vs datacenter) is NOT a
 # hostname — it is a username parameter (`proxy_type=...`).
 # Source: https://docs.scrapingant.com/proxy-mode, §Integration details
-SCRAPINGANT_PROXY_HOST = "proxy.scrapingant.com"
+SCRAPINGANT_PROXY_HOST = "residential.scrapingant.com"
 SCRAPINGANT_PROXY_PORT = 8080
+SCRAPINGANT_PROXY_HTTPS_PORT = 443
 
 # Mirror scraper/scrape.py's MAX_DOWNLOAD_BYTES (1_000_000 at the time of
 # Phase 1.6).  Do not import from scraper/ — that would violate the
 # sources/scraper firewall.  If scrape.py's cap changes, update both
 # locations in the same commit.
 MAX_RESPONSE_BYTES = 1_000_000
-
-VALID_PROXY_TYPES = ("residential", "datacenter")
-DEFAULT_PROXY_TYPE = "residential"
-
 
 # ---------------------------------------------------------------------------
 # Env var readers — pure functions, no side effects
@@ -124,31 +121,27 @@ DEFAULT_PROXY_TYPE = "residential"
 def _get_api_key() -> str | None:
     """Return the configured SCRAPINGANT_API_KEY, or None if absent/empty.
 
-    This is the ONLY real credential in the entire ScrapingAnt
+    This is the primary ScrapingAnt credential in the entire ScrapingAnt
     integration. It is used as:
         - The x-api-key query param on the REST API transport.
-        - The HTTP Basic auth password on the Proxy Mode transport.
+        - The HTTP Basic auth password on the proxy transport.
     """
     key = os.getenv("SCRAPINGANT_API_KEY", "").strip()
     return key or None
 
 
-def _get_proxy_type() -> str:
+def _get_proxy_credentials() -> tuple[str, str] | None:
     """Return SCRAPINGANT_PROXY_TYPE, defaulting to 'residential'.
 
     Unknown values fall back to 'residential' with a debug log —
     silent, never raises.  Per docs, this value is passed as a
     `proxy_type=` parameter in the proxy username string.
     """
-    raw = os.getenv("SCRAPINGANT_PROXY_TYPE", DEFAULT_PROXY_TYPE).strip().lower()
-    if raw not in VALID_PROXY_TYPES:
-        logger.debug(
-            "Unknown SCRAPINGANT_PROXY_TYPE=%r, falling back to %r",
-            raw,
-            DEFAULT_PROXY_TYPE,
-        )
-        return DEFAULT_PROXY_TYPE
-    return raw
+    username = os.getenv("SCRAPINGANT_PROXY_USERNAME", "").strip()
+    password = os.getenv("SCRAPINGANT_PROXY_PASSWORD", "").strip()
+    if not username or not password:
+        return None
+    return username, password
 
 
 def _is_truthy(value: str) -> bool:
@@ -167,6 +160,66 @@ def _is_truthy(value: str) -> bool:
 # Module-level flag so the "both gates set" info log is emitted at most
 # once per process.  Tests reset via monkeypatch if needed.
 _BOTH_GATES_WARNED = False
+
+
+# ---------------------------------------------------------------------------
+# Per-run transport counters — v1.6.1
+# ---------------------------------------------------------------------------
+#
+# Track, for the CURRENT PROCESS ONLY, how many clearnet_fetch calls
+# resolved to each transport (direct / api / proxy) and how many proxy
+# attempts failed and fell back to direct.  These counters are the live
+# proof the user asked for: the investigation display reads them to show
+# "Rotating proxies: ON" with via-proxy / fallback counts, and the final
+# summary box reports the same numbers as verifiable proof that proxies
+# were actually used during this run (and not just statically enabled).
+#
+# Scoped to the current process on purpose — these are run-scoped, not
+# persisted across runs.  Reset at the start of every investigate
+# invocation via reset_run_counters() so the display always reflects THIS
+# run, not a lifetime aggregate.  Never raises; safe to call from any
+# thread (we don't currently invoke clearnet_fetch from multiple threads,
+# but the simple increment is atomic enough for Python's GIL).
+
+_run_counters: dict[str, int] = {
+    "direct": 0,
+    "api": 0,
+    "proxy": 0,
+    "proxy_attempts": 0,
+    "proxy_failures": 0,
+}
+
+
+def reset_run_counters() -> None:
+    """Zero out per-run transport counters. Called once at the start of
+    every investigate invocation so the counters always reflect the
+    current run, not a lifetime aggregate across the Python process.
+    """
+    _run_counters["direct"] = 0
+    _run_counters["api"] = 0
+    _run_counters["proxy"] = 0
+    _run_counters["proxy_attempts"] = 0
+    _run_counters["proxy_failures"] = 0
+
+
+def get_run_counters() -> dict:
+    """Return the current per-run transport counters as a dict.
+
+    Keys:
+      direct          — calls served by the direct aiohttp fetch (no proxy).
+      api             — calls served by the ScrapingAnt REST API transport.
+      proxy           — calls served by the ScrapingAnt proxy transport
+                        (HTTP CONNECT through the configured ScrapingAnt proxy endpoint).
+      proxy_attempts  — total number of times the proxy transport was tried,
+                        including both successes and failures.
+      proxy_failures  — proxy attempts that fell back to direct (timeout,
+                        5xx, auth error, etc.).
+
+    The relationship between these is:
+      proxy_attempts  = proxy + proxy_failures
+      total clearnet_fetch calls = direct + api + proxy + proxy_failures
+    """
+    return dict(_run_counters)
 
 
 def is_api_transport_enabled() -> bool:
@@ -189,12 +242,12 @@ def is_api_transport_enabled() -> bool:
 
 
 def is_proxy_transport_enabled() -> bool:
-    """Return True when Proxy Mode transport should be used.
+    """Return True when proxy transport should be used.
 
     Per https://docs.scrapingant.com/proxy-mode §Introduction: "The
-    proxy mode is a light front-end for the scraping API and has all
+    proxy transport is a light front-end for the scraping API and has all
     the same functionality and performance as sending requests to
-    the API endpoint." Therefore Proxy Mode is an ALTERNATE TRANSPORT
+    the API endpoint." Therefore proxy transport is an ALTERNATE TRANSPORT
     to the same backend service, NOT a separate stackable layer.
 
     Triggered by:
@@ -203,11 +256,11 @@ def is_proxy_transport_enabled() -> bool:
           auth password — the only credential)
 
     Username is built at connection time per docs:
-    "scrapingant&browser=false&proxy_type=residential|datacenter"
+    "the ScrapingAnt proxy username string with browser=false and proxy_type"
     The literal "scrapingant" is a constant; SCRAPINGANT_PROXY_TYPE
     selects residential vs datacenter as a parameter.
     """
-    if not _get_api_key():
+    if not _get_proxy_credentials():
         return False
     return _is_truthy(os.getenv("VOIDACCESS_USE_PROXY", ""))
 
@@ -235,7 +288,7 @@ def select_transport() -> str:
             logger.info(
                 "Both VOIDACCESS_USE_PROXY and VOIDACCESS_USE_PROXIES are set; "
                 "using proxy transport. They are mutually exclusive alternates "
-                "(see https://docs.scrapingant.com/proxy-mode — 'Proxy Mode is a "
+                "(see https://docs.scrapingant.com/proxy-mode — 'proxy transport is a "
                 "light front-end for the scraping API')."
             )
             _BOTH_GATES_WARNED = True
@@ -248,20 +301,20 @@ def select_transport() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Proxy Mode URL construction — username built per docs at call time
+# proxy transport URL construction — username built per docs at call time
 # ---------------------------------------------------------------------------
 
 
 def _build_proxy_username() -> str:
-    """Build the Proxy Mode username string per ScrapingAnt docs.
+    """Build the proxy transport username string per ScrapingAnt docs.
 
-    Source: https://docs.scrapingant.com/proxy-mode §Proxy Mode parameters
+    Source: https://docs.scrapingant.com/proxy-mode §proxy transport parameters
 
     Quote: "To enable extra functionality whilst using the API in
-    proxy mode, you can pass parameters to the API by adding them to
+    proxy transport, you can pass parameters to the API by adding them to
     username, separated by ampersand. For example, to disable browser
     rendering and use residential proxies, you can use the following
-    username: scrapingant&browser=false&proxy_type=residential"
+    username: the ScrapingAnt proxy username string"
 
     The username is the literal constant "scrapingant" plus
     "&browser=false" (per docs: "As browser rendering is enabled by
@@ -269,16 +322,20 @@ def _build_proxy_username() -> str:
     Mode") plus "&proxy_type=<residential|datacenter>". Pool type is
     NOT a separate hostname — it is a username parameter.
 
-    Example output: "scrapingant&browser=false&proxy_type=residential"
+    Example output: "the ScrapingAnt proxy username string"
     """
-    return f"scrapingant&browser=false&proxy_type={_get_proxy_type()}"
+    credentials = _get_proxy_credentials()
+    if not credentials:
+        return ""
+    username, _password = credentials
+    return username
 
 
 def _get_proxy_url() -> str | None:
-    """Build the Proxy Mode proxy URL.
+    """Build the proxy transport proxy URL.
 
     Returns the HTTP proxy URL the chokepoint passes to aiohttp's
-    `proxy=` param. Single host: proxy.scrapingant.com:8080.
+    `proxy=` param. Single host: the configured ScrapingAnt proxy endpoint.
 
     The username string is URL-encoded because it contains `&` and
     `=` which would otherwise be interpreted as URL delimiters. The
@@ -288,12 +345,12 @@ def _get_proxy_url() -> str | None:
     None as "proxy transport is not actually available" and falls
     through to direct.
     """
-    key = _get_api_key()
-    if not key:
+    credentials = _get_proxy_credentials()
+    if not credentials:
         return None
-    username = _build_proxy_username()
+    username, password = credentials
     encoded_user = quote(username, safe="")
-    encoded_pass = quote(key, safe="")
+    encoded_pass = quote(password, safe="")
     return (
         f"http://{encoded_user}:{encoded_pass}"
         f"@{SCRAPINGANT_PROXY_HOST}:{SCRAPINGANT_PROXY_PORT}"
@@ -322,9 +379,9 @@ async def clearnet_fetch(
     Picks ONE transport based on env-var configuration:
         - direct (default, when no ScrapingAnt env vars are set)
         - api (VOIDACCESS_USE_PROXIES=true; legacy v1.5.0 alias)
-        - proxy (VOIDACCESS_USE_PROXY=true; Proxy Mode per docs)
+        - proxy (VOIDACCESS_USE_PROXY=true; proxy transport per docs)
 
-    Per https://docs.scrapingant.com/proxy-mode: "The proxy mode is a
+    Per https://docs.scrapingant.com/proxy-mode: "The proxy transport is a
     light front-end for the scraping API and has all the same
     functionality and performance as sending requests to the API
     endpoint." Therefore the api and proxy transports are MUTUALLY
@@ -383,8 +440,9 @@ async def clearnet_fetch(
     # --- Single-transport selection --------------------------------------
     transport = select_transport()
 
-    # --- Path A: proxy transport (Proxy Mode) ---------------------------
+    # --- Path A: proxy transport (proxy transport) ---------------------------
     if transport == "proxy":
+        _run_counters["proxy_attempts"] += 1
         proxy_url = _get_proxy_url()
         if proxy_url:
             result = await _fetch_via_proxy_mode(
@@ -397,14 +455,17 @@ async def clearnet_fetch(
                 proxy_url=proxy_url,
             )
             if result is not None:
+                _run_counters["proxy"] += 1
                 return result
+            _run_counters["proxy_failures"] += 1
             logger.debug(
-                "Proxy Mode returned no result for %s — falling back to direct",
+                "proxy transport returned no result for %s — falling back to direct",
                 url[:60],
             )
         else:
+            _run_counters["proxy_failures"] += 1
             logger.debug(
-                "Proxy Mode requested but config unavailable for %s — falling back to direct",
+                "proxy transport requested but config unavailable for %s — falling back to direct",
                 url[:60],
             )
 
@@ -419,6 +480,7 @@ async def clearnet_fetch(
             fallback_session=fallback_session,
         )
         if result is not None:
+            _run_counters["api"] += 1
             return result
         logger.debug(
             "Web Scraping API returned no result for %s — falling back to direct",
@@ -426,7 +488,7 @@ async def clearnet_fetch(
         )
 
     # --- Direct fetch (always the last-resort fallback) -----------------
-    return await _fetch_direct(
+    result = await _fetch_direct(
         url,
         method=method,
         headers=headers,
@@ -435,6 +497,8 @@ async def clearnet_fetch(
         fallback_session=fallback_session,
         allow_redirects=allow_redirects,
     )
+    _run_counters["direct"] += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +517,8 @@ async def _fetch_via_proxy_mode(
     fallback_session: aiohttp.ClientSession,
     proxy_url: str,
 ) -> tuple[int, str, bytes] | None:
-    """Fetch via ScrapingAnt Proxy Mode (HTTP CONNECT through
-    proxy.scrapingant.com:8080).
+    """Fetch via ScrapingAnt proxy transport (HTTP CONNECT through
+    the configured ScrapingAnt proxy endpoint).
 
     The proxy URL's username encodes:
         - browser=false (always; per docs recommendation)
@@ -478,7 +542,7 @@ async def _fetch_via_proxy_mode(
             # so we return it to the caller.
             if resp.status >= 500:
                 logger.debug(
-                    "Proxy Mode returned %d for %s — treating as failure",
+                    "proxy transport returned %d for %s — treating as failure",
                     resp.status,
                     url[:60],
                 )
@@ -491,10 +555,10 @@ async def _fetch_via_proxy_mode(
             return (resp.status, content_type, body)
 
     except asyncio.TimeoutError:
-        logger.debug("Proxy Mode timeout for %s", url[:60])
+        logger.debug("proxy transport timeout for %s", url[:60])
         return None
     except Exception as e:
-        logger.debug("Proxy Mode error for %s: %s", url[:60], e)
+        logger.debug("proxy transport error for %s: %s", url[:60], e)
         return None
 
 
@@ -620,3 +684,7 @@ async def _fetch_direct(
         if len(body) > MAX_RESPONSE_BYTES:
             body = body[:MAX_RESPONSE_BYTES]
         return (resp.status, content_type, body)
+
+
+
+

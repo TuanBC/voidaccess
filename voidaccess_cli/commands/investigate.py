@@ -47,10 +47,30 @@ def run(
     model: Optional[str] = typer.Option(None, "--model", help="Override LLM model"),
     no_tor: bool = typer.Option(False, "--no-tor", help="Clearnet-only mode (skip Tor)"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip LLM (query refinement, filtering, summary)"),
+    use_scraping_api: bool = typer.Option(
+        False,
+        "--use-scraping-api",
+        help=(
+            "Clearnet only — activate the ScrapingAnt Web Scraping API REST transport "
+            "(non-rotating, request-based billing, api.scrapingant.com/v2/general) "
+            "for this run. One-shot override; does not touch on-disk config. Requires "
+            "SCRAPINGANT_API_KEY to already be configured via `voidaccess configure` "
+            "or another config surface. Falls back silently to direct clearnet fetch "
+            "if the key is missing. Never affects Tor or .onion."
+        ),
+    ),
     use_proxies: bool = typer.Option(
         False,
         "--use-proxies",
-        help="Clearnet only — route paste/RSS scrapes through ScrapingAnt's REST API transport (legacy v1.5.0 one-shot override). Requires SCRAPINGANT_API_KEY. Never affects Tor or .onion.",
+        help=(
+            "Clearnet only — activate the ScrapingAnt residential proxy transport "
+            "(rotating IPs through residential.scrapingant.com:8080) for this run. "
+            "One-shot override; does not touch on-disk config. Requires "
+            "SCRAPINGANT_PROXY_USERNAME and SCRAPINGANT_PROXY_PASSWORD to have been "
+            "configured once via `voidaccess configure`. Falls back silently to "
+            "direct clearnet fetch if the proxy credentials are missing. Never "
+            "affects Tor or .onion."
+        ),
     ),
     depth: str = typer.Option("normal", "--depth", help="shallow | normal | deep"),
     fmt: str = typer.Option("both", "--format", help="json | md | both"),
@@ -61,16 +81,28 @@ def run(
 
     cli_config.apply_env()
 
-    # Phase 1.6 (corrected per architect review) — one-shot flag for the
-    # REST API transport.  Sets VOIDACCESS_USE_PROXIES=true for the
-    # current process only; the on-disk config is NOT touched.  Per
-    # https://docs.scrapingant.com/proxy-mode the proxy and API transports
-    # are mutually exclusive alternates, so we expose only the API flag
-    # here.  The Proxy Mode transport is configured via
-    # `voidaccess configure proxy --enable-proxy` and is not a one-shot
-    # per-invocation flag.
-    if use_proxies:
+    # v1.6.1 — --use-scraping-api and --use-proxies are one-shot CLI flags
+    # for activating the two independent clearnet transports in-process
+    # only.  The REST API flag sets VOIDACCESS_USE_PROXIES=true; the
+    # residential proxy flag sets VOIDACCESS_USE_PROXY=true.
+    #
+    # SCRAPINGANT_API_KEY / SCRAPINGANT_PROXY_USERNAME / SCRAPINGANT_PROXY_PASSWORD
+    # are loaded into the environment from ~/.voidaccess/config.json by
+    # apply_env() above, so the user does NOT need to `export` anything for
+    # either flag to take effect — they only need to have configured the
+    # required credentials once via `voidaccess configure`.  If the relevant
+    # credential is missing, the chokepoint returns None and we silently fall
+    # back to direct clearnet fetch exactly as before — investigation
+    # completes normally, no error, no crash.
+    #
+    # The REST API transport (VOIDACCESS_USE_PROXIES, plural) is still
+    # reachable via `voidaccess configure proxy --enable` for users who
+    # specifically want the non-rotating REST transport set as a persistent
+    # config option.
+    if use_scraping_api:
         os.environ["VOIDACCESS_USE_PROXIES"] = "true"
+    if use_proxies:
+        os.environ["VOIDACCESS_USE_PROXY"] = "true"
 
     try:
         import spacy
@@ -234,7 +266,32 @@ async def _run_investigation(
 
     cfg = cli_config.load_config()
     preset = DEPTH_PRESETS[depth]
+
+    # v1.6.1 — reset per-run transport counters so the live display and
+    # final summary reflect THIS run, not a lifetime aggregate from any
+    # previous investigation that ran in the same Python process.
+    try:
+        from sources.proxy_client import reset_run_counters
+        reset_run_counters()
+    except Exception:
+        # Never let a counter-reset glitch break the run; the counters
+        # default to 0 so absence is safe.
+        pass
+
     display = InvestigationDisplay(quiet=quiet)
+
+    # v1.6.1 — set the rotating-proxies indicator row BEFORE start() so
+    # it's visible from the first refresh of the live display, not
+    # appended after the run completes.  Use the proxy transport gate
+    # (proxy transport gate) per the v1.6.1 fix that aligns
+    # --use-proxies with the actual rotating-proxy transport the flag
+    # name and the CLI banner promise.
+    try:
+        from sources.proxy_client import is_proxy_transport_enabled
+        display.set_proxy_state("on" if is_proxy_transport_enabled() else "off")
+    except Exception:
+        pass
+
     display.start(query, steps=INVESTIGATION_STEPS)
 
     # Background tasks scheduled during the pipeline that must be awaited
@@ -750,6 +807,25 @@ async def _run_investigation(
         and (e.get("corroborating_sources") or "").lower().find("c2") >= 0
     )
 
+    # v1.6.1 — snapshot the per-run transport counters from the proxy
+    # chokepoint so the final summary box can show real via-proxy /
+    # fallback counts.  Reflects exactly what happened during THIS run,
+    # not a static "enabled" label.
+    proxy_summary: dict = {"state": "off", "via_proxy": 0, "fallback": 0}
+    try:
+        from sources.proxy_client import (
+            get_run_counters,
+            is_proxy_transport_enabled,
+        )
+        counters = get_run_counters()
+        proxy_summary = {
+            "state": "on" if is_proxy_transport_enabled() else "off",
+            "via_proxy": int(counters.get("proxy", 0)),
+            "fallback": int(counters.get("proxy_failures", 0)),
+        }
+    except Exception:
+        pass
+
     display.complete(
         {
             "entity_count": len(final_entities),
@@ -759,6 +835,7 @@ async def _run_investigation(
             "sources_used": sum(1 for v in sources_used.values() if v.get("status") == "ok"),
             "report_path": str(md_path) if fmt in ("md", "both") else None,
             "data_path": str(json_path) if fmt in ("json", "both") else None,
+            "proxy_summary": proxy_summary,
         }
     )
 
@@ -1105,3 +1182,6 @@ def _render_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- {glyph} {name}{detail}")
 
     return "\n".join(lines) + "\n"
+
+
+
