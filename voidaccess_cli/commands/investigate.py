@@ -81,7 +81,7 @@ def run(
 
     cli_config.apply_env()
 
-    # v1.6.1 — --use-scraping-api and --use-proxies are one-shot CLI flags
+    # v1.6.2 — --use-scraping-api and --use-proxies are one-shot CLI flags
     # for activating the two independent clearnet transports in-process
     # only.  The REST API flag sets VOIDACCESS_USE_PROXIES=true; the
     # residential proxy flag sets VOIDACCESS_USE_PROXY=true.
@@ -267,7 +267,7 @@ async def _run_investigation(
     cfg = cli_config.load_config()
     preset = DEPTH_PRESETS[depth]
 
-    # v1.6.1 — reset per-run transport counters so the live display and
+    # v1.6.2 — reset per-run transport counters so the live display and
     # final summary reflect THIS run, not a lifetime aggregate from any
     # previous investigation that ran in the same Python process.
     try:
@@ -280,10 +280,10 @@ async def _run_investigation(
 
     display = InvestigationDisplay(quiet=quiet)
 
-    # v1.6.1 — set the rotating-proxies indicator row BEFORE start() so
+    # v1.6.2 — set the rotating-proxies indicator row BEFORE start() so
     # it's visible from the first refresh of the live display, not
     # appended after the run completes.  Use the proxy transport gate
-    # (proxy transport gate) per the v1.6.1 fix that aligns
+    # (proxy transport gate) per the v1.6.2 fix that aligns
     # --use-proxies with the actual rotating-proxy transport the flag
     # name and the CLI banner promise.
     try:
@@ -807,7 +807,7 @@ async def _run_investigation(
         and (e.get("corroborating_sources") or "").lower().find("c2") >= 0
     )
 
-    # v1.6.1 — snapshot the per-run transport counters from the proxy
+    # v1.6.2 — snapshot the per-run transport counters from the proxy
     # chokepoint so the final summary box can show real via-proxy /
     # fallback counts.  Reflects exactly what happened during THIS run,
     # not a static "enabled" label.

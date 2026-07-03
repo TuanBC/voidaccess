@@ -293,7 +293,7 @@ def apply_env(config: Optional[dict[str, Any]] = None) -> None:
     #
     # - features.use_proxies (legacy v1.5.0) → VOIDACCESS_USE_PROXIES=true
     #   Selects the REST API transport.
-    # - features.use_proxy (new in v1.6.0)  → VOIDACCESS_USE_PROXY=true
+    # - features.use_proxy (new in v1.6.2)  → VOIDACCESS_USE_PROXY=true
     #   Selects the proxy transport.
     #
     # Each is set ONLY when the user has explicitly enabled it.  The

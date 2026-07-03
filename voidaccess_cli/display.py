@@ -69,9 +69,9 @@ class InvestigationDisplay:
         self._spinner_index = 0
         self._final_summary: Optional[dict] = None
         self._error: Optional[str] = None
-        # v1.6.1 — rotating-proxies indicator.  Set via set_proxy_state().
+        # v1.6.2 — rotating-proxies indicator.  Set via set_proxy_state().
         # When None, the row is omitted (back-compat: callers that never
-        # touch it keep the pre-v1.6.1 layout).  When set, the row is
+        # touch it keep the pre-v1.6.2 layout).  When set, the row is
         # always present from the start of the run.
         self._proxy_state: Optional[str] = None  # "on" | "off"
 
@@ -224,7 +224,7 @@ class InvestigationDisplay:
                 sub = Text(f"   {sg} {sub_label}", style=sc)
                 table.add_row("", sub)
 
-        # v1.6.1 — rotating-proxies indicator row, present from the start
+        # v1.6.2 — rotating-proxies indicator row, present from the start
         # of the run, so the user sees it while scraping is actually
         # happening (not just appended at the end).
         if self._proxy_state is not None:
@@ -253,7 +253,7 @@ class InvestigationDisplay:
         table.add_column(style="bold")
         table.add_column()
 
-        # v1.6.1 — "Rotating proxies" line.  This is the actual verifiable
+        # v1.6.2 — "Rotating proxies" line.  This is the actual verifiable
         # proof the user asked for, drawn from the per-run counters in
         # sources.proxy_client, not just a static enabled/disabled label.
         # Summary passes "proxy_summary": {"state": "on"|"off",

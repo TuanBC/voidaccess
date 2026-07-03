@@ -460,14 +460,14 @@ def show_banner(console: Console) -> None:
     if not sys.stdout.isatty() and "PS1" not in os.environ and os.name != "nt":
         return
     console.print()
-    # v1.6.1 — center every line to the same vertical axis.
+    # v1.6.2 — center every line to the same vertical axis.
     #
     # The previous implementation centered each line independently on
     # its own visible width — that *usually* worked but produced up to
     # a half-column of horizontal drift between lines of odd vs even
     # visible widths at certain terminal widths, because `(W - width) // 2`
     # truncates when `W - width` is odd.  That drift was the "left-shifted"
-    # ScrapingAnt block seen in the v1.6.0 banner: its lines are wider
+    # ScrapingAnt block seen in the v1.6.2 banner: its lines are wider
     # than the circle above, so the integer-truncation rounding on its
     # pads differed from the circle's pads by up to 0.5 column.
     #

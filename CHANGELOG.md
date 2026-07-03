@@ -2,6 +2,14 @@
 
 All notable changes to VoidAccess are documented here.
 
+## [1.6.2] - 2026-07-03
+### Added
+- Clarified the final release state after the residential proxy fallback QA pass and the `--use-scraping-api` transport reintroduction.
+- Confirmed the six live-verified safety guarantees from the verification arc, including silent fallback behavior when proxy credentials are invalid.
+
+### Fixed
+- Residential proxy credential handling and release metadata alignment.
+
 ## [1.6.0] - 2026-07-02
 ### Added
 - Optional clearnet ScrapingAnt integration for paste sites and RSS feeds.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voidaccess"
-version = "1.6.0"
+version = "1.6.2"
 description = "Dark web OSINT CLI — automated threat intelligence from query to report"
 readme = "README.md"
 license = "MIT"
@@ -92,11 +92,11 @@ exclude = [
     "__pycache__*",
 ]
 
-# v1.6.1 — ship data/onion_seeds.json inside the installed package.
+# v1.6.2 — ship data/onion_seeds.json inside the installed package.
 # Without this entry, ``pip install voidaccess`` produces a package
 # directory that does NOT contain the curated seed list — every
 # CLI investigation silently gets zero seed injection, which is the
-# exact regression reported in v1.6.0 (every installed CLI logged
+# exact regression reported in v1.6.2 (every installed CLI logged
 # ``Seed file not found: .../site-packages/data/onion_seeds.json``).
 #
 # ``sources.data`` is declared as a sub-package above (its only file

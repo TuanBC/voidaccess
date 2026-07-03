@@ -173,7 +173,7 @@ RSS_FEEDS = [
         "tags": ["cybercrime", "ransomware", "darkweb", "arrest", "seizure", "takedown"],
         "weight": 9,
     },
-    # v1.6.1 — DOJ News (replacement for the permanently-404
+    # v1.6.2 — DOJ News (replacement for the permanently-404
     # /news/press-releases/rss endpoint).  The DOJ restructured their
     # Drupal site and the old press-releases-only RSS path now returns
     # 404; the all-news feed at /news/rss is the working replacement and
@@ -232,7 +232,7 @@ _KNOWN_ACTORS = [
 class RSSCache:
     """Simple file-based cache for RSS feed article lists.
 
-    v1.6.1 — also caches feed-FETCH failures (empty / 404 results) for
+    v1.6.2 — also caches feed-FETCH failures (empty / 404 results) for
     the cache TTL window, so a temporarily-broken feed URL is not
     re-attempted on every investigation within the TTL.  Without this,
     a dead feed URL in RSS_FEEDS would log the same failure on every
@@ -291,7 +291,7 @@ class RSSFeedScraper:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache = RSSCache()
-        # v1.6.1 — per-investigation article-fetch cache.  Same article
+        # v1.6.2 — per-investigation article-fetch cache.  Same article
         # URL appears in many feeds (CISA, FBI, etc. all link to the
         # same parent landing pages) so without this the same URL was
         # being re-fetched 15-17+ times per run, generating a 404 storm
@@ -395,7 +395,7 @@ class RSSFeedScraper:
 
         cached = self._cache.get(feed_url)
         if cached is not None:
-            # v1.6.1 — cache covers both successes AND failures (cached
+            # v1.6.2 — cache covers both successes AND failures (cached
             # as empty list).  A None-miss means the entry has expired
             # or was never written; a non-None return is a cache hit
             # (including the empty-list "this feed failed recently"
@@ -405,7 +405,7 @@ class RSSFeedScraper:
             raw_articles = cached
         else:
             raw_articles = await self._fetch_and_parse(feed_url, feed_name)
-            # v1.6.1 — cache the result either way: successes as the
+            # v1.6.2 — cache the result either way: successes as the
             # article list, failures as [] so the next run within the
             # TTL window skips the fetch entirely (no log spam).
             self._cache.set(feed_url, raw_articles or [])
@@ -561,7 +561,7 @@ class RSSFeedScraper:
         the raw bytes returned by the chokepoint rather than the decoded
         text — the numeric threshold is unchanged).
 
-        v1.6.1 — per-investigation cache:
+        v1.6.2 — per-investigation cache:
         Consults ``self._article_fetch_cache`` first.  A cached entry (success
         or ``None`` for failure) is returned immediately without a network
         call, so the same article URL is fetched at most once per run.  The
@@ -574,7 +574,7 @@ class RSSFeedScraper:
         if not url or not self._session:
             return None
 
-        # --- v1.6.1: per-run article cache check -------------------------
+        # --- v1.6.2: per-run article cache check -------------------------
         cached = self._article_fetch_cache.get(url)
         if cached is not None:
             # Either a real string (success — return text directly) or

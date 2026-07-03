@@ -11,7 +11,7 @@ relevant entries.  Those seed URLs are injected into the scrape queue
 ahead of the search-engine fan-out so that known intelligence sources are
 always visited for an applicable query.
 
-Seed file resolution (v1.6.1):
+Seed file resolution (v1.6.2):
 The seed JSON ships INSIDE the installed Python package under
 ``sources/data/onion_seeds.json`` so it's present after
 ``pip install voidaccess``.  We resolve the file via ``importlib.resources``
@@ -29,7 +29,7 @@ The previous implementation used
 which works in a git checkout but silently fails in a pip install
 because ``<site-packages>/data/`` does not exist.  That produced the
 "Seed file not found: .../site-packages/data/onion_seeds.json" WARNING
-every CLI user saw in v1.6.0.
+every CLI user saw in v1.6.2.
 """
 
 from __future__ import annotations
@@ -49,11 +49,11 @@ from utils.content_safety import is_blocked_url
 
 logger = logging.getLogger(__name__)
 
-# Back-compat shim — pre-v1.6.1 callers (and the seed_manager's own
+# Back-compat shim — pre-v1.6.2 callers (and the seed_manager's own
 # legacy code) sometimes reference SEED_FILE directly.  We populate it
 # lazily so any module that reads it during import gets the correct,
 # installed-package-aware path on first access (not the import-time
-# v1.6.0-broken sibling-of-sources/ path).
+# v1.6.2-broken sibling-of-sources/ path).
 def _resolve_seed_file() -> Path:
     """Return the on-disk path to data/onion_seeds.json, robust to both
     pip-installed and local-checkout invocations.
@@ -65,7 +65,7 @@ def _resolve_seed_file() -> Path:
          any parent directory.  Works for local git checkouts where the
          ``sources.data`` sub-package is not importable (it only exists
          when the wheel was built with the new package-data layout).
-      3. Fall back to the original v1.6.0-broken sibling-of-sources/
+      3. Fall back to the original v1.6.2-broken sibling-of-sources/
          path so we still get a clear WARNING rather than a hard crash
          if neither path resolves (developer-mode, half-installed env, …).
     """
@@ -87,7 +87,7 @@ def _resolve_seed_file() -> Path:
         if candidate.is_file():
             return candidate
 
-    # 3. Original v1.6.0 path — sibling of sources/.  Will not exist in
+    # 3. Original v1.6.2 path — sibling of sources/.  Will not exist in
     # a clean pip install, but we surface a clear WARNING rather than
     # raising so callers can degrade gracefully.
     legacy = here.parent.parent / "data" / "onion_seeds.json"

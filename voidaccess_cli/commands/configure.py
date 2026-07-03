@@ -352,7 +352,7 @@ def configure_proxy(
     With no flags, runs the interactive prompt.  With --enable / --disable,
     sets the REST API transport toggle non-interactively (legacy v1.5.0
     flag).  With --enable-proxy / --disable-proxy, sets the proxy transport
-    transport toggle (new in v1.6.0 — requires SCRAPINGANT_API_KEY to
+    transport toggle (new in v1.6.2 — requires SCRAPINGANT_API_KEY to
     actually activate).
 
     The two transports are MUTUALLY EXCLUSIVE alternates per

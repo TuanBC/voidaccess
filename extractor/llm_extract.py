@@ -192,7 +192,7 @@ async def extract_with_llm(
       no results rather than raising.
     - Never raises.
 
-    Streaming-output suppression (v1.6.1):
+    Streaming-output suppression (v1.6.2):
     Each chunk's LLM call goes through ``await llm.ainvoke(prompt)``.  The
     LangChain model is configured with ``streaming=True`` and a
     ``BufferedStreamingHandler`` callback that ``print()``s every ~60 chars
@@ -200,7 +200,7 @@ async def extract_with_llm(
     prints raw LLM tokens (including partial JSON objects) directly to the
     user's terminal at every chunk boundary — which, for the user, looks
     like the ``{"crypto_w {"threat_actor"...`` corruption signature
-    reported in v1.6.0.
+    reported in v1.6.2.
 
     The chunk-merge logic itself is correct: each chunk's raw response is
     parsed independently via ``json.loads`` with markdown-fence stripping,
@@ -390,7 +390,7 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
 async def _extract_chunk(chunk: str, llm) -> str:
     """Send one chunk to LLM and return raw response content. Returns '' on error.
 
-    v1.6.1 — streaming-output suppression.
+    v1.6.2 — streaming-output suppression.
     ``llm`` was instantiated with ``streaming=True`` and a
     ``BufferedStreamingHandler`` callback that ``print()``s every ~60 chars
     of the streamed response to stdout.  During extraction that callback

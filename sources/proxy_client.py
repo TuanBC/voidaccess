@@ -163,7 +163,7 @@ _BOTH_GATES_WARNED = False
 
 
 # ---------------------------------------------------------------------------
-# Per-run transport counters — v1.6.1
+# Per-run transport counters — v1.6.2
 # ---------------------------------------------------------------------------
 #
 # Track, for the CURRENT PROCESS ONLY, how many clearnet_fetch calls
