@@ -44,6 +44,7 @@ from urllib.parse import quote_plus
 
 import aiohttp
 
+from sources.proxy_client import clearnet_fetch
 from utils.content_safety import is_blocked_query, sanitize_content
 
 logger = logging.getLogger(__name__)
@@ -312,16 +313,14 @@ class PasteScraper:
         search_url = search_url_template.format(query=encoded_term)
 
         try:
-            async with self._session.get(
+            status, _content_type, body = await clearnet_fetch(
                 search_url,
-                allow_redirects=True,
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                html = await resp.text(
-                    encoding="utf-8",
-                    errors="ignore",
-                )
+                expect="html",
+                fallback_session=self._session,
+            )
+            if status != 200:
+                return []
+            html = body.decode("utf-8", errors="ignore")
 
             pattern = source.get("result_pattern") or ""
             if not pattern:
@@ -358,28 +357,22 @@ class PasteScraper:
         paste_url = source["paste_url"].format(id=paste_id)
 
         try:
-            async with self._session.get(
+            status, _content_type, body = await clearnet_fetch(
                 paste_url,
-                allow_redirects=True,
-            ) as resp:
-                if resp.status != 200:
-                    return {}
+                expect="text",
+                fallback_session=self._session,
+            )
+            if status != 200:
+                return {}
 
-                content_length_header = resp.headers.get("content-length", "0")
-                try:
-                    content_length = int(content_length_header)
-                except ValueError:
-                    content_length = 0
-                if content_length > MAX_PASTE_SIZE:
-                    return {}
+            # Size gate now uses the real bytes received, not the
+            # content-length header (which can be missing or wrong).
+            # Truncate to MAX_PASTE_SIZE if needed; the threshold value
+            # is preserved exactly from the pre-v1.6 implementation.
+            if len(body) > MAX_PASTE_SIZE:
+                body = body[:MAX_PASTE_SIZE]
 
-                content = await resp.text(
-                    encoding="utf-8",
-                    errors="ignore",
-                )
-
-            if len(content) > MAX_PASTE_SIZE:
-                content = content[:MAX_PASTE_SIZE]
+            content = body.decode("utf-8", errors="ignore")
 
             clean_content, was_flagged = sanitize_content(content)
             if was_flagged:

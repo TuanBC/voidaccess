@@ -19,6 +19,20 @@ Commercial threat intelligence platforms often charge prohibitive annual fees fo
 
 ---
 
+## What's New in v1.6.0
+
+- **Optional clearnet scraping proxy (ScrapingAnt)** — paste sites and RSS feeds can now be routed through ScrapingAnt. Affects clearnet scraping only; Tor, `.onion`, GitHub, and GitLab traffic are never affected.
+- **Two mutually exclusive transports** — pick one, not both:
+  - **REST API transport** — `VOIDACCESS_USE_PROXIES=true` (legacy v1.5.0 toggle) routes requests through ScrapingAnt's Web Scraping API.
+  - **Proxy Mode transport** — `VOIDACCESS_USE_PROXY=true` routes requests through ScrapingAnt's HTTP CONNECT endpoint at `proxy.scrapingant.com:8080`.
+  - Per [ScrapingAnt docs](https://docs.scrapingant.com/proxy-mode): "Proxy Mode is a light front-end for the scraping API and has all the same functionality and performance" — so the two are alternate transports to the same backend, never chained.
+- **`SCRAPINGANT_PROXY_TYPE`** — `residential` (default) or `datacenter`; per docs this is passed as a `proxy_type=` parameter in the Proxy Mode username string (which is built at connection time as `"scrapingant&browser=false&proxy_type=..."`). NOT a separate hostname.
+- **Single credential** — `SCRAPINGANT_API_KEY` is the only real credential; the Proxy Mode username is a literal constant per docs. No per-customer username field, no second key.
+- **New CLI surfaces** — `voidaccess configure proxy` now prompts for key + type in one uninterrupted block, plus `--enable-proxy / --disable-proxy` for non-interactive Proxy Mode toggling and `--show` for masked state inspection.
+- **55 → 74 proxy-config tests** — covers both transports, the `apply_env()` independent-toggle guarantee, the single-transport selection logic, and the masked `--show` output.
+
+---
+
 ## What's New in v1.5.0
 
 - 37 new entity types across crypto, credentials, messaging, and network/forensic indicators.
@@ -82,6 +96,7 @@ The Docker stack includes PostgreSQL, Tor, FastAPI, and Next.js.
 | `voidaccess actor <handle> --note "text"` | Append an analyst note to an actor profile |
 | `voidaccess timeline <handle>` | Shortcut for `voidaccess actor <handle> --timeline` |
 | `voidaccess configure` | Setup wizard |
+| `voidaccess configure proxy` | ScrapingAnt key, username, type, and routing toggles. Flags: `--enable / --disable` (API gate), `--enable-proxy / --disable-proxy` (proxy gate), `--show` (masked state) |
 
 Export examples:
 
@@ -253,6 +268,46 @@ All enrichment sources that require a key degrade gracefully when the key is abs
 | `GITLAB_TOKEN` | Raises GitLab scraping from 15 to 60 req/min | Free | [gitlab.com/profile/personal_access_tokens](https://gitlab.com/-/profile/personal_access_tokens) |
 | `BLOCKCYPHER_TOKEN` | BTC/ETH wallet balance and transaction graph | Yes | [blockcypher.com](https://www.blockcypher.com) |
 | `ETHERSCAN_API_KEY` | ETH wallet lookups | Yes | [etherscan.io/apis](https://etherscan.io/apis) |
+| `SCRAPINGANT_API_KEY` + `VOIDACCESS_USE_PROXIES=true` | Optional clearnet proxy for paste sites + RSS feeds (see below) | Yes (free tier) | [scrapingant.com](https://scrapingant.com/?ref=mzliyzh) |
+
+### Optional: Clearnet Scraping Proxy (ScrapingAnt)
+
+When a third-party clearnet site rate-limits or blocks VoidAccess's outbound IP, every paste site fetch and every RSS feed fetch in the same investigation can fail. The optional **ScrapingAnt** integration routes those specific requests through ScrapingAnt — either its Web Scraping API or its Proxy Mode HTTP CONNECT endpoint at `proxy.scrapingant.com:8080`.
+
+**What it covers** — paste sites (Pastebin, dpaste, paste.ee, Rentry) and the 20 curated RSS security feeds (Krebs on Security, BleepingComputer, Talos, Mandiant, CrowdStrike, Unit 42, CISA, and others). Nothing else.
+
+**What it does not cover** — Tor traffic, dark web scraping, and `.onion` fetches are **completely unaffected** by this setting regardless of how it is configured. The proxy only sees the two clearnet sources named above.
+
+**GitHub and GitLab scraping are also unaffected** — and intentionally so. Both of those scrapers carry authentication tokens (`GITHUB_TOKEN`, `GITLAB_TOKEN`) in their requests. Forwarding those tokens through a third-party proxy would expose them to that third party, which is unacceptable from a security standpoint. Both scrapers always go direct to the GitHub/GitLab API regardless of the proxy setting. This is a permanent design constraint, not something the proxy toggle can override.
+
+**It's entirely optional.** VoidAccess behaves identically without it — paste sites and RSS feeds are simply fetched directly, exactly as they were in every prior release. Add the key only if you see upstream rate-limiting or blocks affecting those two sources.
+
+#### Two mutually exclusive transports (v1.6.0)
+
+Per the [ScrapingAnt docs](https://docs.scrapingant.com/proxy-mode): *"The proxy mode is a light front-end for the scraping API and has all the same functionality and performance as sending requests to the API endpoint."* Therefore the two transports below are **alternate transports to the same backend service** — pick ONE per request, never both:
+
+| Transport | Env var | Required config | What it does |
+|---|---|---|---|
+| **REST API** | `VOIDACCESS_USE_PROXIES=true` | `SCRAPINGANT_API_KEY` | POSTs the target URL to `api.scrapingant.com/v2/general` and returns the response body. Legacy v1.5.0 toggle. |
+| **Proxy Mode** | `VOIDACCESS_USE_PROXY=true` | `SCRAPINGANT_API_KEY` (only) | Routes the request as HTTP CONNECT through `proxy.scrapingant.com:8080` with username string built at connection time per docs: `scrapingant&browser=false&proxy_type=residential\|datacenter`. |
+
+The Proxy Mode transport also reads `SCRAPINGANT_PROXY_TYPE` to pick the pool: `residential` (default; harder to detect, slightly higher latency) or `datacenter` (faster, cheaper, easier to fingerprint).
+
+**Missing credentials leave both transports inactive.** Setting either transport env var to `true` without `SCRAPINGANT_API_KEY` is a no-op for that transport. No errors, no surprises.
+
+**If both transport env vars are set, Proxy Mode wins** with a one-shot info log at runtime — there is no chained mode (Proxy Mode is documented as "the same functionality" as the REST API, so stacking them would double-charge without adding capability).
+
+**How to turn it on** — all four surfaces, covering either transport:
+
+| Surface | How |
+|---|---|
+| CLI configure wizard | `voidaccess configure` then `voidaccess configure keys` — paste sites and RSS feeds will be flagged with their honest "never Tor" description before any field is asked for. The interactive prompt covers the key, pool type, and asks about each transport separately. |
+| `voidaccess configure proxy` (subcommand) | Interactive prompt for key + pool type. Non-interactive flags: `--enable / --disable` (REST API transport), `--enable-proxy / --disable-proxy` (Proxy Mode transport), `--show` (prints masked key `abcd…5678`, pool type, and both transport states). |
+| `setup.sh` during Docker install | Group F in the Enrichment Keys step; prompts for key + pool type, asks about each transport toggle separately. |
+| `--use-proxies` flag (single run) | `voidaccess investigate "query" --use-proxies` — sets `VOIDACCESS_USE_PROXIES=true` (REST API transport) for the current process only, leaves the on-disk config untouched. |
+| Docker / web settings page | Settings → API Keys → ScrapingAnt. Stored encrypted at rest via the existing per-user `UserApiKey` mechanism (Fernet AES-128). |
+
+**Referral signup:** [https://scrapingant.com/?ref=mzliyzh](https://scrapingant.com/?ref=mzliyzh) (referral bonus applied on first paid plan; a free tier is available for low-volume use).
 
 ---
 

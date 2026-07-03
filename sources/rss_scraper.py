@@ -46,6 +46,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from sources.enrichment import is_onion_url
+from sources.proxy_client import clearnet_fetch
 from utils.content_safety import is_blocked_query, sanitize_content
 
 logger = logging.getLogger(__name__)
@@ -388,14 +390,27 @@ class RSSFeedScraper:
         return relevant
 
     async def _fetch_and_parse(self, feed_url: str, feed_name: str) -> list[dict]:
-        """Fetch and parse an RSS/Atom feed XML."""
+        """Fetch and parse an RSS/Atom feed XML.
+
+        Phase 1.6 wiring: feeds are fetched through the
+        ``clearnet_fetch`` chokepoint from ``sources.proxy_client``.
+        The chokepoint forces ``browser=false`` on any proxy path,
+        which is what preserves the raw XML bytes — a headless-browser
+        rendering would mangle them.  On any non-200 the empty-list
+        contract is preserved exactly.
+        """
         if not self._session:
             return []
         try:
-            async with self._session.get(feed_url, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    return []
-                content = await resp.text(encoding="utf-8", errors="ignore")
+            status, _content_type, body = await clearnet_fetch(
+                feed_url,
+                expect="xml",
+                timeout=15,  # preserve session's default timeout
+                fallback_session=self._session,
+            )
+            if status != 200:
+                return []
+            content = body.decode("utf-8", errors="ignore")
             return self._parse_feed(content, feed_url)
         except asyncio.TimeoutError:
             logger.debug("RSS timeout: %s", feed_name)
@@ -466,22 +481,56 @@ class RSSFeedScraper:
         return articles
 
     async def _fetch_article_content(self, url: str) -> Optional[str]:
-        """Fetch and extract plain text from an article URL."""
+        """Fetch and extract plain text from an article URL.
+
+        Two layers of defense against a .onion URL being fetched over clearnet:
+
+        1. The ``is_onion_url`` guard here (BELT) — fires before any network
+           call, returns None, logs at debug, and triggers the existing
+           summary-fallback in ``_fetch_feed`` exactly like any other failure.
+        2. The chokepoint's own guard inside ``clearnet_fetch`` (SUSPENDERS)
+           — raises ValueError unconditionally on .onion URLs.
+
+        Both are intentional redundancy.  A routing bug that bypassed the
+        chokepoint would still be caught here.  The curated RSS_FEEDS list
+        is entirely clearnet security blogs, so this guard is purely
+        structural protection, not something that fires in normal operation.
+
+        Phase 1.6 wiring: the fetch itself goes through ``clearnet_fetch``,
+        with the per-call timeout preserved at 10 s and the size-truncation
+        threshold preserved at ``MAX_ARTICLE_SIZE`` (now measured against
+        the raw bytes returned by the chokepoint rather than the decoded
+        text — the numeric threshold is unchanged).
+        """
         if not url or not self._session:
             return None
+
+        # --- Belt-and-suspenders .onion guard -----------------------------
+        if is_onion_url(url):
+            logger.debug(
+                "RSS article URL is .onion — refusing clearnet fetch: %s",
+                url[:60],
+            )
+            return None
+
         try:
-            async with self._session.get(
+            status, _content_type, body = await clearnet_fetch(
                 url,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text(encoding="utf-8", errors="ignore")
-                if len(html) > MAX_ARTICLE_SIZE:
-                    html = html[:MAX_ARTICLE_SIZE]
-                text = self._extract_article_text(html)
-                return text if len(text) > 100 else None
+                expect="html",
+                timeout=10,  # preserve existing per-call timeout
+                fallback_session=self._session,
+            )
+            if status != 200:
+                return None
+            # Size gate now uses the real bytes received, not the decoded
+            # text.  The threshold value (MAX_ARTICLE_SIZE) is unchanged;
+            # only the unit (chars → bytes) shifts for the truncation
+            # slice — for ASCII content the behavior is identical.
+            if len(body) > MAX_ARTICLE_SIZE:
+                body = body[:MAX_ARTICLE_SIZE]
+            html = body.decode("utf-8", errors="ignore")
+            text = self._extract_article_text(html)
+            return text if len(text) > 100 else None
         except Exception:
             return None
 

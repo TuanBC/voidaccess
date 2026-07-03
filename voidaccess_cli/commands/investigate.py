@@ -47,6 +47,11 @@ def run(
     model: Optional[str] = typer.Option(None, "--model", help="Override LLM model"),
     no_tor: bool = typer.Option(False, "--no-tor", help="Clearnet-only mode (skip Tor)"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip LLM (query refinement, filtering, summary)"),
+    use_proxies: bool = typer.Option(
+        False,
+        "--use-proxies",
+        help="Clearnet only — route paste/RSS scrapes through ScrapingAnt's REST API transport (legacy v1.5.0 one-shot override). Requires SCRAPINGANT_API_KEY. Never affects Tor or .onion.",
+    ),
     depth: str = typer.Option("normal", "--depth", help="shallow | normal | deep"),
     fmt: str = typer.Option("both", "--format", help="json | md | both"),
     quiet: bool = typer.Option(False, "--quiet", help="No live display; print final summary only"),
@@ -55,6 +60,17 @@ def run(
     from voidaccess_cli import config as cli_config
 
     cli_config.apply_env()
+
+    # Phase 1.6 (corrected per architect review) — one-shot flag for the
+    # REST API transport.  Sets VOIDACCESS_USE_PROXIES=true for the
+    # current process only; the on-disk config is NOT touched.  Per
+    # https://docs.scrapingant.com/proxy-mode the proxy and API transports
+    # are mutually exclusive alternates, so we expose only the API flag
+    # here.  The Proxy Mode transport is configured via
+    # `voidaccess configure proxy --enable-proxy` and is not a one-shot
+    # per-invocation flag.
+    if use_proxies:
+        os.environ["VOIDACCESS_USE_PROXIES"] = "true"
 
     try:
         import spacy

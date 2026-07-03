@@ -803,6 +803,127 @@ printf "\n"
 _save_enrich_key "EMAILREP_API_KEY" "$EMAILREP_KEY"
 
 # ---------------------------------------------------------------------------
+# Group F — Clearnet Scraping Proxy (optional, opt-in)
+# ---------------------------------------------------------------------------
+# ScrapingAnt routes paste sites and RSS feeds through a residential
+# proxy pool.  This is the only place in setup.sh that asks for a
+# boolean toggle alongside a key — a saved key with the toggle off
+# is the same as not configuring the feature at all.
+#
+# Phase 1.6 — also asks for the proxy pool type and two independent
+# transport toggles.  These are only needed if the user wants the Web
+# Scraping API path and/or rotating residential/datacenter Proxy Mode
+# path.  Skip-by-default keeps "no behavior change" as the default.
+printf "\n${DIM}  ── Clearnet Scraping Proxy ───────────${NC}\n\n"
+
+# ── Partnership banner ─────────────────────────────────────────────────
+# VoidAccess is partnered with ScrapingAnt — Web Scraping API + rotating
+# residential/datacenter proxy pool.  Sign up via the referral link to
+# unlock a bonus on your first paid plan (free tier is available too).
+printf "${CYAN}  Partnered with ScrapingAnt:${NC} ${BOLD}Web Scraping with Rotating Proxies${NC}\n"
+printf "  Sign up: ${BOLD}${CYAN}https://scrapingant.com/?ref=mzliyzh${NC}\n\n"
+
+# Safety statement — placed BEFORE any prompt so the user sees it before
+# deciding to enable.  This is the single most safety-critical claim in
+# the whole integration: ScrapingAnt must never see Tor/.onion traffic.
+# Also explicit that pressing Enter at every prompt below is safe — it
+# skips the feature entirely with no behavior change.
+printf "  ${BOLD}Affects paste sites and RSS feeds only.${NC}  ${YELLOW}Never touches Tor or .onion traffic${YELLOW} —\n"
+printf "  dark web scraping is completely unaffected regardless of what you enter below.\n\n"
+printf "  ${DIM}Press Enter to skip every prompt below — that leaves ScrapingAnt fully off, with no behavior change.${NC}\n\n"
+
+prompt "ScrapingAnt key (optional, referral bonus) [https://scrapingant.com/?ref=mzliyzh]: "
+read -rs SCRAPINGANT_KEY || SCRAPINGANT_KEY=""
+printf "\n"
+if [ -n "$SCRAPINGANT_KEY" ]; then
+    # Probe the API to confirm the key is real.  ScrapingAnt's general
+    # endpoint echoes the target's status code back to us — a 200 here
+    # means the key authenticated AND the upstream was reachable.
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        "https://api.scrapingant.com/v2/general?url=https://example.com&x-api-key=$SCRAPINGANT_KEY" \
+        2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+        env_update "SCRAPINGANT_API_KEY" "$SCRAPINGANT_KEY"
+        print_ok "ScrapingAnt key valid"
+        _enrich_configured=$(( _enrich_configured + 1 ))
+
+        # --- SCRAPINGANT_PROXY_TYPE (residential default, datacenter for higher bandwidth) ---
+        # Per https://docs.scrapingant.com/proxy-mode this is passed as a
+        # `proxy_type=` parameter in the Proxy Mode username string (which
+        # is built at connection time as "scrapingant&browser=false&proxy_type=...").
+        # It is NOT a per-customer credential and there is NO proxy-username
+        # field to ask for.
+        printf "\n"
+        printf "  ${CYAN}▸${NC}  Proxy pool type [${BOLD}residential${NC}/datacenter] ${DIM}(press Enter for residential)${NC}: "
+        read -r SCRAPINGANT_PROXY_TYPE || SCRAPINGANT_PROXY_TYPE=""
+        SCRAPINGANT_PROXY_TYPE="${SCRAPINGANT_PROXY_TYPE:-residential}"
+        case "${SCRAPINGANT_PROXY_TYPE,,}" in
+            datacenter)
+                env_update "SCRAPINGANT_PROXY_TYPE" "datacenter"
+                print_ok "Pool type: datacenter"
+                ;;
+            *)
+                env_update "SCRAPINGANT_PROXY_TYPE" "residential"
+                print_ok "Pool type: residential"
+                ;;
+        esac
+
+        # --- Transport toggles ---
+        # The two ScrapingAnt transports (REST API vs Proxy Mode via
+        # proxy.scrapingant.com:8080) are MUTUALLY EXCLUSIVE alternates
+        # per https://docs.scrapingant.com/proxy-mode §Introduction —
+        # "Proxy Mode is a light front-end for the scraping API and has
+        # all the same functionality and performance." We ask about each
+        # separately; enabling both means the chokepoint picks Proxy
+        # Mode at runtime (logged with a one-shot info message).
+        printf "\n"
+        printf "  ${CYAN}▸${NC}  Enable REST API transport (ScrapingAnt Web Scraping API) for paste + RSS scrapes? [y/${BOLD}N${NC}]: "
+        read -r api_ans || api_ans="n"
+        api_ans="${api_ans:-n}"
+        if [[ "${api_ans,,}" == "y" ]]; then
+            env_update "VOIDACCESS_USE_PROXIES" "true"
+            print_ok "REST API transport enabled"
+        else
+            env_update "VOIDACCESS_USE_PROXIES" "false"
+            print_info "REST API transport disabled — enable later by uncommenting VOIDACCESS_USE_PROXIES=true in .env"
+        fi
+
+        printf "\n"
+        printf "  ${CYAN}▸${NC}  Enable Proxy Mode transport (HTTP CONNECT through proxy.scrapingant.com:8080, ${SCRAPINGANT_PROXY_TYPE,,} pool) for paste + RSS scrapes? [y/${BOLD}N${NC}]: "
+        read -r proxy_ans || proxy_ans="n"
+        proxy_ans="${proxy_ans:-n}"
+        if [[ "${proxy_ans,,}" == "y" ]]; then
+            env_update "VOIDACCESS_USE_PROXY" "true"
+            print_ok "Proxy Mode transport enabled (paste + RSS only — never Tor)"
+        else
+            env_update "VOIDACCESS_USE_PROXY" "false"
+            print_info "Proxy Mode transport disabled — enable later by uncommenting VOIDACCESS_USE_PROXY=true in .env"
+        fi
+    else
+        print_warn "Key test failed (HTTP $HTTP_CODE)"
+        response="$(wait_for_key "Save anyway" "N")"
+        if [ "$response" = "Y" ] || [ "$response" = "y" ]; then
+            env_update "SCRAPINGANT_API_KEY" "$SCRAPINGANT_KEY"
+            env_update "VOIDACCESS_USE_PROXIES" "false"
+            env_update "VOIDACCESS_USE_PROXY" "false"
+            env_update "SCRAPINGANT_PROXY_TYPE" "residential"
+            print_info "Saved (untested), routing disabled by default"
+            _enrich_configured=$(( _enrich_configured + 1 ))
+        else
+            print_info "Key discarded"
+            _enrich_skipped=$(( _enrich_skipped + 1 ))
+        fi
+    fi
+else
+    # Pressed Enter — zero behavior change.  Make sure BOTH toggles
+    # are not accidentally left set to "true" by a prior run.
+    env_update "VOIDACCESS_USE_PROXIES" "false"
+    env_update "VOIDACCESS_USE_PROXY" "false"
+    env_update "SCRAPINGANT_PROXY_TYPE" "residential"
+    _enrich_skipped=$(( _enrich_skipped + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf "\n"

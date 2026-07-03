@@ -2,6 +2,84 @@
 
 All notable changes to VoidAccess are documented here.
 
+## [1.6.0] - 2026-07-02
+### Added
+- Optional clearnet scraping proxy integration
+  (ScrapingAnt) — routes paste site and RSS feed
+  fetches through ScrapingAnt to improve
+  reliability on flaky upstreams. Covers
+  `paste_scraper.py` and `rss_scraper.py` only.
+  Dark web / Tor scraping is completely
+  unaffected. GitHub and GitLab scraping are
+  also unaffected and intentionally so — both
+  carry auth tokens and are permanently excluded
+  from the proxy path. Any proxy failure
+  (timeout, auth, 5xx, malformed response)
+  silently falls back to a direct request.
+- Two **mutually exclusive** ScrapingAnt
+  transports (per
+  [docs.scrapingant.com/proxy-mode](https://docs.scrapingant.com/proxy-mode)
+  §Introduction: "Proxy Mode is a light
+  front-end for the scraping API and has all
+  the same functionality and performance"):
+  - **REST API transport** —
+    `VOIDACCESS_USE_PROXIES=true` (legacy
+    v1.5.0 toggle) routes requests through the
+    ScrapingAnt Web Scraping API. Requires
+    `SCRAPINGANT_API_KEY`. CLI surface:
+    `voidaccess configure proxy --enable /
+    --disable`.
+  - **Proxy Mode transport** —
+    `VOIDACCESS_USE_PROXY=true` routes requests
+    through ScrapingAnt's HTTP CONNECT endpoint
+    at `proxy.scrapingant.com:8080`. Requires
+    `SCRAPINGANT_API_KEY` only — the username
+    string is built at connection time per docs
+    as
+    `"scrapingant&browser=false&proxy_type=..."`.
+    CLI surface:
+    `voidaccess configure proxy --enable-proxy /
+    --disable-proxy`.
+  - The two transports are **alternates, not
+    combinable.** Enabling both means the
+    chokepoint picks Proxy Mode and emits a
+    one-shot info log at runtime. There is no
+    chained mode.
+- New optional ScrapingAnt config:
+  - `SCRAPINGANT_PROXY_TYPE` — `residential`
+    (default; harder to detect, slightly higher
+    latency) or `datacenter` (faster, cheaper,
+    easier to fingerprint). Env-var-only; not a
+    secret. Per docs, this is passed as a
+    `proxy_type=` parameter in the Proxy Mode
+    username string — it is NOT a separate
+    hostname.
+- New CLI surfaces on `voidaccess configure
+  proxy`:
+  - Interactive prompt now covers the key and
+    pool type in one uninterrupted block with
+    honest wording ("clearnet scraping only",
+    "never touches Tor traffic") and asks
+    about each transport separately.
+  - `--enable-proxy / --disable-proxy` —
+    non-interactive Proxy Mode transport
+    toggle; warns when the API key is missing.
+  - `--show` — prints masked key
+    (`abcd…5678`), pool type, and both
+    transport states (enabled / disabled).
+    Short credentials render as `set` to avoid
+    substring leakage.
+- `setup.sh` Group F now prompts only for the
+  pool type and asks about each transport
+  toggle separately (REST API and Proxy Mode
+  are mutually exclusive choices).
+- Tests: 55 CLI proxy-config tests
+  (`tests/test_cli_proxy_config.py`), 63
+  proxy-client tests
+  (`tests/test_proxy_client.py`), 19
+  paste-scraper tests, 27 RSS-scraper tests.
+  All passing.
+
 ## [1.5.0] - 2026-06-25
 ### Added
 - 37 new entity types across crypto addresses,

@@ -36,6 +36,18 @@ ENRICHMENT_KEYS = [
     "ETHERSCAN_API_KEY",
     "DEEPL_API_KEY",
     "DARKSEARCH_API_KEY",
+    # Phase 1.6 — optional clearnet proxy. The ONLY credential needed
+    # for either the REST API transport or Proxy Mode transport per
+    # https://docs.scrapingant.com/proxy-mode. Never touches Tor or
+    # .onion traffic. Stored in the same enrichment_keys section as
+    # every other optional key.
+    "SCRAPINGANT_API_KEY",
+    # Phase 1.6 — proxy pool type.  Accepts "residential" (default) or
+    # "datacenter".  Empty when the feature is unused; the chokepoint
+    # defaults to "residential" if this is unset.  Per docs, this is
+    # passed as a `proxy_type=` parameter in the Proxy Mode username
+    # string, NOT as a separate hostname.
+    "SCRAPINGANT_PROXY_TYPE",
 ]
 
 PROVIDER_ENV = {
@@ -54,6 +66,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "api_key": "",
     },
     "enrichment_keys": {k: "" for k in ENRICHMENT_KEYS},
+    # Phase 1.6 — boolean feature toggles persisted across CLI invocations.
+    # Currently used for the optional clearnet proxy (ScrapingAnt).  Read by
+    # apply_env() and pushed to os.environ so the runtime chokepoint
+    # (sources/proxy_client.py) sees the same value the user set in
+    # `voidaccess configure`.
+    "features": {
+        # Phase 1.6 — boolean feature toggles persisted across CLI
+        # invocations.  Currently used for the optional clearnet proxy
+        # (ScrapingAnt).  Read by apply_env() and pushed to os.environ
+        # so the runtime chokepoint (sources/proxy_client.py) sees the
+        # same value the user set in `voidaccess configure`.
+        #
+        # use_proxies           → VOIDACCESS_USE_PROXIES=true
+        #                         Selects the REST API transport.
+        #                         (legacy v1.5.0 alias; Phase 1 verified
+        #                         correct, must not be touched.)
+        #
+        # use_proxy             → VOIDACCESS_USE_PROXY=true
+        #                         Selects the Proxy Mode transport.
+        #                         Per docs (https://docs.scrapingant.com/
+        #                         proxy-mode §Introduction) Proxy Mode is
+        #                         "a light front-end for the scraping API
+        #                         and has all the same functionality and
+        #                         performance as sending requests to the
+        #                         API endpoint" — so the two transports
+        #                         are mutually exclusive alternates,
+        #                         NEVER combinable.  When both flags are
+        #                         set, the chokepoint picks proxy and
+        #                         emits a one-shot info log.
+        "use_proxies": False,
+        "use_proxy": False,
+    },
     "tor": {
         "host": "127.0.0.1",
         "port": 9050,
@@ -80,6 +124,7 @@ def load_config() -> dict[str, Any]:
     merged["llm"].update(cfg.get("llm", {}))
     merged["tor"].update(cfg.get("tor", {}))
     merged["enrichment_keys"].update(cfg.get("enrichment_keys", {}))
+    merged["features"].update(cfg.get("features", {}))
     if cfg.get("output_dir"):
         merged["output_dir"] = cfg["output_dir"]
     return merged
@@ -238,6 +283,31 @@ def apply_env(config: Optional[dict[str, Any]] = None) -> None:
     # Enrichment keys
     for k, v in (cfg.get("enrichment_keys") or {}).items():
         _set_env_if_present(k, v, clear_if_empty=True)
+
+    # Phase 1.6 — clearnet proxy toggles.  Per architect review these
+    # are MUTUALLY EXCLUSIVE alternates, not independently combinable
+    # gates (see sources/proxy_client.py §Architectural grounding for
+    # the full quote from https://docs.scrapingant.com/proxy-mode).
+    #
+    # - features.use_proxies (legacy v1.5.0) → VOIDACCESS_USE_PROXIES=true
+    #   Selects the REST API transport.
+    # - features.use_proxy (new in v1.6.0)  → VOIDACCESS_USE_PROXY=true
+    #   Selects the Proxy Mode transport.
+    #
+    # Each is set ONLY when the user has explicitly enabled it.  The
+    # chokepoint reads these env vars AND SCRAPINGANT_API_KEY, so missing
+    # key gracefully leaves both transports inactive — no error, no
+    # fallback surprise.  This is the same logic already proven in
+    # Phase 1's tests.
+    features = cfg.get("features") or {}
+    if features.get("use_proxies"):
+        os.environ["VOIDACCESS_USE_PROXIES"] = "true"
+    else:
+        os.environ.pop("VOIDACCESS_USE_PROXIES", None)
+    if features.get("use_proxy"):
+        os.environ["VOIDACCESS_USE_PROXY"] = "true"
+    else:
+        os.environ.pop("VOIDACCESS_USE_PROXY", None)
 
     # Keyless APIs (ThreatFox/URLhaus/MalwareBazaar/abuse.ch) must never
     # receive an empty auth header — clear any empty env remnant.

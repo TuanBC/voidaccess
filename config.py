@@ -99,6 +99,23 @@ HYBRID_ANALYSIS_API_KEY = _clean_env("HYBRID_ANALYSIS_API_KEY", "")
 HIBP_API_KEY      = _clean_env("HIBP_API_KEY", "")
 EMAILREP_API_KEY  = _clean_env("EMAILREP_API_KEY", "")
 
+# Phase 1.6 — optional clearnet proxy.  Read directly by
+# sources/proxy_client.py via os.getenv; the module-level constant is
+# exposed for code that wants to introspect the value (the same way
+# OTX_API_KEY, ABUSEIPDB_API_KEY, etc. are exposed for their consumers).
+# Never affects Tor or .onion traffic — only paste sites and RSS feeds.
+SCRAPINGANT_API_KEY = _clean_env("SCRAPINGANT_API_KEY", "")
+
+# Phase 1.6 — ScrapingAnt proxy pool type.  Accepts `residential` (default)
+# or `datacenter`.  Read directly by sources/proxy_client.py via os.getenv;
+# defaults to "residential" if unset or any other value (the chokepoint
+# normalizes there).  Per https://docs.scrapingant.com/proxy-mode this is
+# passed as a `proxy_type=` parameter in the Proxy Mode username string
+# (built at connection time as "scrapingant&browser=false&proxy_type=...").
+# This is a value, not a credential, so it stays a plain env var (no
+# UserApiKey registration on the API surface).
+SCRAPINGANT_PROXY_TYPE = _clean_env("SCRAPINGANT_PROXY_TYPE", "residential")
+
 SHODAN_RATE_LIMIT_DELAY = 1.0        # seconds between Shodan requests (InternetDB)
 MAX_IPS_PER_INVESTIGATION = 50      # max IPs to query Shodan per investigation
 MAX_HASHES_PER_INVESTIGATION = 20    # max file hashes to query VirusTotal per investigation
@@ -161,6 +178,7 @@ OPTIONAL_KEYS = [
     "LLAMA_CPP_BASE_URL",
     "BLOCKCYPHER_TOKEN",
     "ETHERSCAN_API_KEY",
+    "SCRAPINGANT_API_KEY",
 ]
 
 

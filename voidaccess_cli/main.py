@@ -46,7 +46,10 @@ BANNER = """\
 [color(183)] ░[color(141)]█████████████████[color(183)]░[/]
 [color(183)]  ░░[color(141)]█████████████[color(183)]░░[/]
 [color(183)]     ░░░░░[color(141)]█[color(183)]░░░░░[/]
-[dim white]   dark web osint intelligence[/dim white]"""
+[dim white]dark web osint intelligence[/dim white]
+[dim cyan]━━━ Partnered with ScrapingAnt ━━━[/dim cyan]
+[bright_cyan]Web Scraping with Rotating Proxies[/bright_cyan]
+[link=https://scrapingant.com/?ref=mzliyzh][dim italic]↗ scrapingant.com[/dim italic][/link]"""
 
 app = typer.Typer(
     name="voidaccess",
@@ -194,6 +197,44 @@ def status(
     keys = cfg.get("enrichment_keys", {})
     set_count = sum(1 for v in keys.values() if v)
     table.add_row("Enrichment keys", f"{set_count}/{len(keys)} set")
+
+    # Phase 1.6 (corrected per architect review) — show the clearnet-routing
+    # state.  Per https://docs.scrapingant.com/proxy-mode §Introduction
+    # ("Proxy Mode is a light front-end for the scraping API") the two
+    # transports are mutually exclusive alternates — there is no
+    # combined "chained" state.  We delegate to the chokepoint's
+    # transport selector so the display ALWAYS matches what
+    # clearnet_fetch() will actually do.  Never reveals raw keys.
+    #
+    #   both off          → red    "disabled"           (direct — v1.5.0 behavior)
+    #   proxy only        → cyan   "Proxy Mode"         (HTTP CONNECT through proxy.scrapingant.com:8080)
+    #   api only          → green  "REST API"          (POST api.scrapingant.com/v2/general)
+    #   both on (proxy wins) → magenta "Proxy Mode (api would be overridden)"
+    from sources.proxy_client import (
+        is_api_transport_enabled,
+        is_proxy_transport_enabled,
+        select_transport,
+    )
+    api_gate = is_api_transport_enabled()
+    proxy_gate = is_proxy_transport_enabled()
+    selected = select_transport()
+    if selected == "proxy":
+        if api_gate:
+            routing_state = "[magenta]Proxy Mode (REST API overridden)[/magenta]"
+            routing_detail = "Proxy Mode transport; REST API gate was also on but proxy wins"
+        else:
+            routing_state = "[cyan]Proxy Mode[/cyan]"
+            routing_detail = "HTTP CONNECT through proxy.scrapingant.com:8080"
+    elif selected == "api":
+        routing_state = "[green]REST API[/green]"
+        routing_detail = "POST api.scrapingant.com/v2/general"
+    else:
+        routing_state = "[red]disabled[/red]"
+        routing_detail = "direct fetch (no ScrapingAnt)"
+    table.add_row(
+        "Clearnet routing",
+        f"{routing_state} ({routing_detail}) — paste + RSS only, never Tor",
+    )
 
     # Inline enrichment-cache summary (always shown when --cache is set,
     # otherwise the row is omitted). Never raises — cache is best-effort.
@@ -398,16 +439,33 @@ def version() -> None:
     console.print(f"voidaccess {__version__}")
 
 
+def _banner_line_visible_width(line: str) -> int:
+    """Return the visible character width of a banner line.
+
+    Strips Rich markup tags (e.g. ``[color(141)]``, ``[/]``, ``[link=URL]``,
+    ``[bold]``) so block-character art and text lines can both be measured
+    for proper centering.  Each remaining character counts as 1 width unit
+    (the banner is ASCII-only, so wcwidth isn't needed).
+    """
+    import re as _re
+    return len(_re.sub(r"\[/?[^\]]*\]", "", line))
+
+
 def show_banner(console: Console) -> None:
-    import shutil
     if os.environ.get("TERM") == "dumb":
         return
     if not sys.stdout.isatty() and "PS1" not in os.environ and os.name != "nt":
         return
     console.print()
-    raw_line = "     oooooXooooo     "  # widest line, 21 chars
-    pad = max(0, (console.width - len(raw_line)) // 2)
+    # Center each line on its own visible width so the logo block, the
+    # "dark web osint intelligence" tagline, and the longer partner-banner
+    # lines all line up on the same vertical axis.  Pre-computing a single
+    # pad value (the old behaviour) only worked because the banner used
+    # to be a single fixed-width ASCII block; the partner-banner lines
+    # added in v1.6.0 are wider and need their own pad.
     for line in BANNER.split("\n"):
+        visible = _banner_line_visible_width(line)
+        pad = max(0, (console.width - visible) // 2)
         console.print(" " * pad + line)
     console.print()
 

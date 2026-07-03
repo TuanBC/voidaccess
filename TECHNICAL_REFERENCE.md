@@ -504,6 +504,70 @@ Articles from curated threat intelligence blogs. Feed results are cached per-URL
 
 Configured feeds include: Krebs on Security, BleepingComputer, The Record by Recorded Future, Cisco Talos, Mandiant, CrowdStrike, Unit 42, CISA, and others.
 
+#### Optional Clearnet Scraping Proxy (`SCRAPINGANT_API_KEY` + transport toggle)
+
+Paste sites and RSS feeds can be routed through [ScrapingAnt](https://scrapingant.com/?ref=mzliyzh) to reduce blocking and rate-limiting from flaky upstreams. This is **off by default** and **entirely optional**; without it, both source types go direct exactly as in every prior release.
+
+**Single-credential design.** Per the [ScrapingAnt Proxy Mode docs](https://docs.scrapingant.com/proxy-mode), the **only real credential** is `SCRAPINGANT_API_KEY`. The Proxy Mode username string is the literal constant `scrapingant` plus runtime parameters (`browser=false`, `proxy_type=residential|datacenter`) appended after `&`. There is no per-customer username field — registering one in our config would have invited users to look for a value they cannot obtain from ScrapingAnt.
+
+**Two mutually exclusive transports.** Per the docs (§Introduction): *"The proxy mode is a light front-end for the scraping API and has all the same functionality and performance as sending requests to the API endpoint."* Therefore the two transports below are **alternate transports to the same backend service** — pick ONE per request, never both:
+
+| Transport | Env var (literal `"true"`, case-insensitive) | Required config | CLI surface |
+|---|---|---|---|
+| **REST API** | `VOIDACCESS_USE_PROXIES` | `SCRAPINGANT_API_KEY` (non-empty) | `voidaccess configure proxy --enable / --disable`, `--use-proxies` flag |
+| **Proxy Mode** | `VOIDACCESS_USE_PROXY` | `SCRAPINGANT_API_KEY` (non-empty) | `voidaccess configure proxy --enable-proxy / --disable-proxy` |
+
+`SCRAPINGANT_PROXY_TYPE` (`residential` default, or `datacenter`) is only read by the Proxy Mode transport; it is passed as a `proxy_type=` parameter in the Proxy Mode username string per docs — **not** a separate hostname. (There is one documented proxy host: `proxy.scrapingant.com:8080` for HTTP, `:443` for HTTPS.)
+
+**Single-transport selection per request.** `select_transport()` in `sources/proxy_client.py` picks exactly one transport: Proxy Mode → REST API → direct (default). If both transport env vars are set, Proxy Mode wins with a one-shot info log; there is no chained mode.
+
+**Routing decision — per request, by destination, not as a global switch.** The chokepoint decides per call whether to attempt the selected transport. It is not a process-wide switch that gates all outbound traffic; every other request (Tor, GitHub, GitLab, all enrichment) bypasses this code path entirely. On any failure from the selected transport (timeout, auth, 5xx, malformed response) the chokepoint silently falls through to direct.
+
+**Two-layer `.onion` guard.** `.onion` URLs are refused unconditionally at two layers:
+
+1. The chokepoint's own hard guard at the very first line of `clearnet_fetch()` — fires before any transport check or env read, raises `ValueError` immediately, never makes a network call. This is the safety net for any future caller that might forget.
+2. An additional guard added specifically in `sources/rss_scraper.py::_fetch_article_content()` before the chokepoint is invoked. Because RSS feed items can link to arbitrary URLs, this guard makes an `.onion` link in a feed fail with a logged debug message and a `None` return (triggering the existing summary-fallback) rather than reaching the chokepoint at all. Belt-and-suspenders.
+
+**Silent fallback to direct on any proxy failure.** Any failure from the selected transport — timeout, auth error (403), rate limit, 5xx, malformed response, missing/unparseable `ant-page-status-code` header — causes the corresponding helper to return `None`. The caller then silently falls back to the direct request via the same `aiohttp.ClientSession` that the proxy call would have used. No exception propagates to the scraper; the user sees the same result they would have seen with the transport disabled. This fallback is automatic, requires no user intervention, and is exercised by the proxy-client test suite.
+
+**Exact scope boundary:**
+
+| Source | Uses chokepoint? | Why |
+|---|---|---|
+| `sources/paste_scraper.py` | Yes — both `_search_source` and `_fetch_paste` route through `clearnet_fetch` | Clearnet scraping, no auth tokens in request |
+| `sources/rss_scraper.py` | Yes — both `_fetch_and_parse` and `_fetch_article_content` route through `clearnet_fetch` | Clearnet scraping, no auth tokens in request |
+| `sources/github_scraper.py` | **No — permanently excluded** | Sends `Authorization: Bearer ${GITHUB_TOKEN}` on every request. Forwarding that token through a third-party proxy would expose the token to that third party. The proxy is opt-in, this scraper is not, and the security risk of an opt-in feature silently exfiltrating credentials is unacceptable. |
+| `sources/gitlab_scraper.py` | **No — permanently excluded** | Same reasoning: sends `PRIVATE-TOKEN: ${GITLAB_TOKEN}`. |
+
+This is a permanent design constraint, not a configurable option. No flag or env var can route GitHub or GitLab traffic through the proxy. Both scrapers always go direct to their respective APIs.
+
+**Storage — mixed by access path.** Where `SCRAPINGANT_API_KEY` lives depends on how it was set:
+
+- **CLI path** (`voidaccess configure` / `voidaccess configure keys` / `voidaccess configure proxy`): stored in `~/.voidaccess/config.json` as plaintext within the existing `enrichment_keys` structure. Consistent with how every other CLI-side optional key (`OTX_API_KEY`, `GITHUB_TOKEN`, `HIBP_API_KEY`, etc.) is stored in that file. The two transport toggles live in `features.use_proxies` and `features.use_proxy`.
+- **Docker / web settings path** (Settings → API Keys → ScrapingAnt): stored encrypted at rest via the existing per-user `UserApiKey` mechanism (Fernet AES-128, same as every other key registered with `ALLOWED_KEY_NAMES` in `api/routes/settings.py`). `SCRAPINGANT_PROXY_TYPE` is env-var-only (it's a value, not a secret). `SCRAPINGANT_PROXY_USERNAME` is intentionally NOT registered — it does not exist as a per-customer credential per docs.
+- **`.env` / `setup.sh` path**: stored as a plaintext line in `.env`, identical to every other key in that file. `apply_env()` in `voidaccess_cli/config.py` pushes it into `os.environ` at process start and toggles `VOIDACCESS_USE_PROXIES` / `VOIDACCESS_USE_PROXY` based on the `features` flags.
+
+**Configurable surface (full list, v1.6.0):**
+
+- `SCRAPINGANT_API_KEY` (env var) — the only credential; required by both transports
+- `SCRAPINGANT_PROXY_TYPE` (env var) — `residential` (default) or `datacenter`; read only by the Proxy Mode transport; passed as a `proxy_type=` parameter in the Proxy Mode username string per docs
+- `VOIDACCESS_USE_PROXIES` (env var) — literal `true` activates the REST API transport; legacy v1.5.0 toggle
+- `VOIDACCESS_USE_PROXY` (env var) — literal `true` activates the Proxy Mode transport; new in v1.6.0
+- `voidaccess configure proxy` (interactive) — prompts for key + pool type; asks about each transport separately
+- `voidaccess configure proxy --enable / --disable` — non-interactive REST API toggle; warns when the key is missing
+- `voidaccess configure proxy --enable-proxy / --disable-proxy` — non-interactive Proxy Mode toggle; warns when the key is missing
+- `voidaccess configure proxy --show` — prints masked key (`abcd…5678`), pool type, and both transport states (enabled / disabled)
+- `voidaccess investigate ... --use-proxies` — one-shot override that sets `VOIDACCESS_USE_PROXIES=true` (REST API transport only) for the current process only, without modifying the on-disk config
+- `voidaccess status` — displays a "Clearnet routing" row showing the actual state so the user can tell at a glance whether the chokepoint is currently routing
+
+**Internal API endpoints (do not change — these are not signup links):**
+
+| Constant | Value | Source |
+|---|---|---|
+| `SCRAPINGANT_BASE_URL` | `https://api.scrapingant.com/v2/general` | REST API transport endpoint |
+| `SCRAPINGANT_PROXY_HOST` | `proxy.scrapingant.com` | Single documented Proxy Mode host (HTTP: port 8080) |
+| `SCRAPINGANT_PROXY_PORT` | `8080` | HTTP port; HTTPS is 443
+
 ### 3.3 Seed URLs
 
 `data/onion_seeds.json` is a JSON catalogue of curated `.onion` addresses organised by category. The `SeedManager` scores entries against the query using tag and name matching and returns up to 10 relevant seeds. Seeds are injected before the search fan-out and bypass the LLM filter. The seed file refreshes weekly (Sunday 03:00 UTC) via the APScheduler job.
@@ -1285,6 +1349,10 @@ At least one LLM provider key is needed for query refinement, result filtering, 
 | `GITLAB_MAX_RESULTS` | `15` | Max GitLab results per investigation |
 | `RSS_FEEDS_ENABLED` | `true` | Set `false` to disable RSS feed scraping |
 | `RSS_MAX_ARTICLES` | `20` | Max RSS articles per investigation |
+| `SCRAPINGANT_API_KEY` | — | Optional. **The only real credential** for the ScrapingAnt integration. Per [docs.scrapingant.com/proxy-mode](https://docs.scrapingant.com/proxy-mode) §Integration details, the Proxy Mode username is the literal constant `scrapingant` plus runtime parameters — there is no per-customer `customer-XXXX` username field. Routes paste site and RSS feed fetches through ScrapingAnt (REST API or Proxy Mode) to improve reliability on flaky upstreams. Affects clearnet scraping only — never Tor, `.onion`, GitHub, or GitLab (those two carry auth tokens and are permanently excluded). Any proxy failure (timeout, auth, 5xx, malformed response) silently falls back to a direct request. See §3.2 for the routing mechanism. |
+| `SCRAPINGANT_PROXY_TYPE` | `residential` | Pool type for the Proxy Mode transport. `residential` (default; harder to detect, slightly higher latency) or `datacenter` (faster, cheaper, easier to fingerprint). Per docs, this is passed as a `proxy_type=` parameter in the Proxy Mode username string (built at connection time as `scrapingant&browser=false&proxy_type=...`) — **not** a separate hostname. There is one documented proxy host: `proxy.scrapingant.com:8080` (HTTP) or `:443` (HTTPS). Env-var-only; not a secret. Ignored when neither transport is active. |
+| `VOIDACCESS_USE_PROXIES` | `false` | **REST API transport.** Set to `true` to route paste sites and RSS feeds through the ScrapingAnt Web Scraping API (`POST api.scrapingant.com/v2/general`). Without `SCRAPINGANT_API_KEY`, this is a no-op. Legacy v1.5.0 toggle; CLI: also set by `voidaccess configure proxy --enable / --disable` or the `--use-proxies` flag on `voidaccess investigate`. Mutually exclusive with `VOIDACCESS_USE_PROXY` (per docs, Proxy Mode is "a light front-end for the scraping API" — they are alternate transports to the same backend, not chained). |
+| `VOIDACCESS_USE_PROXY` | `false` | **Proxy Mode transport.** Set to `true` to route requests as HTTP CONNECT through `proxy.scrapingant.com:8080`. Requires `SCRAPINGANT_API_KEY` only (the proxy username is the literal constant `scrapingant` plus runtime params, NOT a per-customer credential). Mutually exclusive with `VOIDACCESS_USE_PROXIES` — if both are set, the chokepoint picks Proxy Mode with a one-shot info log. CLI: `voidaccess configure proxy --enable-proxy / --disable-proxy`. New in v1.6.0. |
 
 ### 13.6 DNS/WHOIS Enrichment
 
@@ -1435,3 +1503,7 @@ Free-tier models on OpenRouter enforce per-minute rate limits. The pipeline has 
 ### Single-Worker Cancellation Only
 
 `_cancel_flags` is an in-process dict. Cancellation works only when the HTTP cancel request and the pipeline background task run in the same uvicorn worker process. Multi-worker deployments (e.g., `--workers 4`) break cancellation for investigations running on a different worker.
+
+### Proxy Mode Over Plain HTTP Can Return 502
+
+When `VOIDACCESS_USE_PROXY=true` is set and the target URL is plain HTTP (not HTTPS), the ScrapingAnt Proxy Mode endpoint occasionally returns HTTP 502 instead of the target's content. HTTPS targets succeed reliably. Because real-world paste sites and the curated RSS feed list are nearly universally HTTPS, this only surfaces against an unusual plain-HTTP target and the silent fallback to direct (`sources/proxy_client.py::_fetch_via_proxy_mode` returns `None` on `resp.status >= 500`, then the chokepoint retries without the proxy) still returns usable content. The REST API transport (`VOIDACCESS_USE_PROXIES=true`) is not affected — the same chokepoint has no observed flakiness on plain HTTP via the `/v2/general` endpoint. If a future investigation produces unexpectedly few results from a plain-HTTP source, the cause is this; switching to REST API or to direct is a workaround.

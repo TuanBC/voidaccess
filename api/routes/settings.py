@@ -176,6 +176,40 @@ ALLOWED_KEY_NAMES = {
         "test_header": "Key",
         "test_prefix": "",
     },
+    # Phase 1.6 — ScrapingAnt clearnet proxy.
+    # Routes paste sites and RSS feeds through ScrapingAnt to improve
+    # reliability on flaky upstreams.  Never touches Tor/dark web traffic.
+    # Per https://docs.scrapingant.com/proxy-mode this single API key is
+    # the ONLY real credential — it authenticates both the REST API
+    # transport (POST to api.scrapingant.com) and the Proxy Mode transport
+    # (HTTP CONNECT through proxy.scrapingant.com:8080).  The Proxy Mode
+    # username string ("scrapingant&browser=false&proxy_type=...") is built
+    # at connection time; "scrapingant" is a literal constant.
+    #
+    # The two transport toggles (VOIDACCESS_USE_PROXIES, VOIDACCESS_USE_PROXY)
+    # are separate env vars and are intentionally NOT exposed as keys here.
+    "SCRAPINGANT_API_KEY": {
+        "label": "ScrapingAnt",
+        "description": (
+            "Optional. Routes clearnet scraping (paste sites, RSS feeds) "
+            "through ScrapingAnt (REST API or Proxy Mode) to improve reliability. "
+            "[yellow]Never affects Tor or .onion requests.[/yellow] "
+            "Sign up at https://scrapingant.com/?ref=mzliyzh (referral bonus applied)."
+        ),
+        "test_url": "https://api.scrapingant.com/v2/general?url=https://example.com&x-api-key={key}",
+        "test_header": None,
+        "test_prefix": None,
+    },
+    # SCRAPINGANT_PROXY_USERNAME is intentionally NOT registered here.
+    # Per https://docs.scrapingant.com/proxy-mode §Integration details,
+    # the Proxy Mode username is the LITERAL CONSTANT "scrapingant" (with
+    # parameters like `browser=false&proxy_type=residential` appended
+    # after `&`).  It is NOT a per-customer credential and there is no
+    # `customer-XXXX` field on the ScrapingAnt dashboard.  Registering
+    # one would have invited users to look for a value they cannot
+    # actually obtain, producing support noise.  SCRAPINGANT_PROXY_TYPE
+    # (residential vs datacenter) is also not registered — it's a value,
+    # not a secret, and stays a plain env var.
 }
 
 
